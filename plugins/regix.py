@@ -94,6 +94,11 @@ async def pub_(bot, message):
                 if message.empty or message.service:
                    sts.add('deleted')
                    continue
+                disabled_types = data.get('filters', []) if isinstance(data, dict) else []
+                msg_type = message.media.value if message.media else "text"
+                if msg_type in disabled_types:
+                   sts.add('filtered')
+                   continue
                 if forward_tag:
                    MSG.append(message.id)
                    notcompleted = len(MSG)
