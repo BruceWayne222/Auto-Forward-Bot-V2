@@ -55,9 +55,8 @@ async def start_clone_bot(FwdBot, data=None):
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
-            except Exception:
-                # If message doesn't exist (yet), get_messages returns None or list with None?
-                # Pyrogram get_messages with list returns list of Messages or None
+            except Exception as e:
+                print(f"Failed to fetch messages from {chat_id} (offset {current}): {e}")
                 messages = []
 
             # Filter out None values (messages that don't exist yet)
