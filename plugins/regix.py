@@ -72,12 +72,14 @@ async def pub_(bot, message):
           # Use getattr to safely check for 'continuous' attribute since old STS objects might not have it
           is_continuous = getattr(sts, 'continuous', False)
 
+          skip_duplicate = data.get('skip_duplicate', False) if isinstance(data, dict) else False
           async for message in client.iter_messages(
             client,
             chat_id=sts.get('FROM'), 
             limit=int(sts.get('limit')), 
             offset=int(sts.get('skip')) if sts.get('skip') else 0,
-            continuous=is_continuous
+            continuous=is_continuous,
+            skip_duplicate=skip_duplicate
             ):
                 if await is_cancelled(client, user, m, sts):
                    return

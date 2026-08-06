@@ -23,6 +23,13 @@ BTN_URL_REGEX = re.compile(r"(\[([^\[]+?)]\[buttonurl:/{0,2}(.+?)(:same)?])")
 BOT_TOKEN_TEXT = "<b>1) create a bot using @BotFather\n2) Then you will get a message with bot token\n3) Forward that message to me</b>"
 SESSION_STRING_SIZE = 351
 
+def get_file_unique_id(message):
+   """Return the stable file_unique_id for a message's media, or None for text/non-media."""
+   if not message.media:
+      return None
+   media = getattr(message, message.media.value, None)
+   return getattr(media, 'file_unique_id', None) if media else None
+
 async def start_clone_bot(FwdBot, data=None):
    await FwdBot.start()
    #
@@ -33,7 +40,8 @@ async def start_clone_bot(FwdBot, data=None):
       offset: int = 0,
       search: str = None,
       filter: "types.TypeMessagesFilter" = None,
-      continuous: bool = False
+      continuous: bool = False,
+      skip_duplicate: Union[list, bool] = False
       ) -> Optional[AsyncGenerator["types.Message", None]]:
         """Iterate through a chat sequentially."""
         current = offset
@@ -72,6 +80,15 @@ async def start_clone_bot(FwdBot, data=None):
                     return
 
             for message in valid_messages:
+                if skip_duplicate and message.media:
+                    file_unique_id = get_file_unique_id(message)
+                    if file_unique_id:
+                        dup_uri, target_chat = skip_duplicate
+                        is_dup = await db.is_duplicate_file(file_unique_id, target_chat, dup_uri)
+                        if is_dup:
+                            yield "DUPLICATE"
+                            current = max(current, message.id) + 1
+                            continue
                 yield message
                 current = max(current, message.id) + 1
 
