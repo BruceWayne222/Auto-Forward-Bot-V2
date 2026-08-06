@@ -16,7 +16,9 @@ class Database:
         self.bot = self.db.bots
         self.col = self.db.users
         self.nfy = self.db.notify
-        self.chl = self.db.channels 
+        self.chl = self.db.channels
+        self.dup = self.db.duplicates
+        self._dup_clients = {}
         
     def new_user(self, id, name):
         return dict(
@@ -167,5 +169,41 @@ class Database:
     
     async def get_all_frwd(self):
        return self.nfy.find({})
-     
+
+    def _get_dup_collection(self, dup_uri=None):
+       """Return the collection used to track forwarded file ids for duplicate-skip.
+       If the user configured a custom database uri (Settings -> Database), use a
+       'duplicates' collection there so history survives across bot restarts /
+       redeploys. Otherwise fall back to the collection on the bot's own database
+       (which still works, but only persists as long as this database does)."""
+       if not dup_uri:
+          return self.dup
+       client = self._dup_clients.get(dup_uri)
+       if client is None:
+          client = motor.motor_asyncio.AsyncIOMotorClient(dup_uri)
+          self._dup_clients[dup_uri] = client
+       return client["AutoForwardBot"]["duplicates"]
+
+    async def is_duplicate_file(self, file_unique_id, chat_id, dup_uri=None):
+       """Atomically check whether file_unique_id has already been forwarded to
+       chat_id. Records it the first time it's seen so later calls detect it.
+       Returns True if this is a duplicate, False if it's new."""
+       if not file_unique_id:
+          return False
+       try:
+          collection = self._get_dup_collection(dup_uri)
+          existing = await collection.find_one_and_update(
+             {"chat_id": int(chat_id), "file_id": file_unique_id},
+             {"$setOnInsert": {"chat_id": int(chat_id), "file_id": file_unique_id}},
+             upsert=True
+          )
+          return existing is not None
+       except Exception as e:
+          print(f"[duplicate-check] failed, allowing message through: {e}")
+          return False
+
+    async def clear_duplicate_history(self, chat_id, dup_uri=None):
+       collection = self._get_dup_collection(dup_uri)
+       await collection.delete_many({"chat_id": int(chat_id)})
+
 db = Database(Config.DATABASE_URI, Config.DATABASE_NAME)
