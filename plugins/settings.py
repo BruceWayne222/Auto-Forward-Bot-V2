@@ -396,6 +396,173 @@ async def settings_query(bot, query):
   elif type.startswith("alert"):
     alert = type.split('_')[1]
     await query.answer(alert, show_alert=True)
+
+  # ---------- Rate Limit / Safe Mode UI ----------
+  elif type == "ratelimit":
+     cfg = await get_configs(user_id)
+     delay = cfg.get('delay', 5)
+     safe = cfg.get('safe_mode', True)
+     batch = cfg.get('batch_size', 30)
+     text = (
+        "<b><u>🐢 RATE LIMIT / SAFE MODE</u></b>\n\n"
+        "These settings reduce ban risk when using a <b>Userbot</b> on private/restricted channels.\n\n"
+        f"• <b>Delay:</b> <code>{delay}s</code> between each message\n"
+        f"• <b>Safe Mode:</b> {'✅ ON' if safe else '❌ OFF'} (jitter + adaptive slowdown + rest pauses)\n"
+        f"• <b>Batch size:</b> <code>{batch}</code> (when Forward Tag is ON)\n\n"
+        "<i>Bots: 0.5–2s OK · Userbots: ≥4s + Safe Mode ON</i>"
+     )
+     buttons = [
+        [InlineKeyboardButton(f'⏱ Delay: {delay}s', callback_data='settings#setdelay')],
+        [
+           InlineKeyboardButton('-5s', callback_data=f'settings#delayadj-{-5}'),
+           InlineKeyboardButton('-1s', callback_data=f'settings#delayadj-{-1}'),
+           InlineKeyboardButton('+1s', callback_data=f'settings#delayadj-1'),
+           InlineKeyboardButton('+5s', callback_data=f'settings#delayadj-5'),
+        ],
+        [InlineKeyboardButton(
+            f"🛡 Safe Mode: {'ON ✅' if safe else 'OFF ❌'}",
+            callback_data=f'settings#togglesafe-{not safe}'
+        )],
+        [
+           InlineKeyboardButton('Batch -5', callback_data=f'settings#batchadj-{-5}'),
+           InlineKeyboardButton(f'Batch: {batch}', callback_data='settings#noop'),
+           InlineKeyboardButton('Batch +5', callback_data=f'settings#batchadj-5'),
+        ],
+        [InlineKeyboardButton('↩ Back', callback_data='settings#main')],
+     ]
+     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+  elif type == "setdelay":
+     await query.message.delete()
+     try:
+         ask = await bot.ask(user_id, "<b>Send delay in seconds (0.5–120).\nBots can use 0.5–2s safely. Userbots prefer ≥4s.\n/cancel to abort</b>")
+         if ask.text == "/cancel":
+            return await ask.reply("<b>Cancelled</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩ Back', callback_data='settings#ratelimit')]]))
+         val = float(ask.text.strip())
+         if not 0.5 <= val <= 120:
+            return await ask.reply("<b>Must be between 0.5 and 120</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩ Back', callback_data='settings#ratelimit')]]))
+         await update_configs(user_id, 'delay', val)
+         await ask.reply(f"<b>Delay set to {val}s</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩ Back', callback_data='settings#ratelimit')]]))
+     except Exception:
+         await query.message.reply("<b>Invalid number</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩ Back', callback_data='settings#ratelimit')]]))
+
+  elif type.startswith("delayadj"):
+     delta = int(type.split('-', 1)[1])
+     cfg = await get_configs(user_id)
+     new_delay = max(0.5, min(120, float(cfg.get('delay', 5)) + delta))
+     await update_configs(user_id, 'delay', new_delay)
+     # Re-render the ratelimit panel
+     query.data = "settings#ratelimit"
+     # Fall through by editing again
+     cfg = await get_configs(user_id)
+     delay = cfg.get('delay', 5)
+     safe = cfg.get('safe_mode', True)
+     batch = cfg.get('batch_size', 30)
+     text = (
+        "<b><u>🐢 RATE LIMIT / SAFE MODE</u></b>\n\n"
+        "These settings reduce ban risk when using a <b>Userbot</b> on private/restricted channels.\n\n"
+        f"• <b>Delay:</b> <code>{delay}s</code> between each message\n"
+        f"• <b>Safe Mode:</b> {'✅ ON' if safe else '❌ OFF'} (jitter + adaptive slowdown + rest pauses)\n"
+        f"• <b>Batch size:</b> <code>{batch}</code> (when Forward Tag is ON)\n\n"
+        "<i>Bots: 0.5–2s OK · Userbots: ≥4s + Safe Mode ON</i>"
+     )
+     buttons = [
+        [InlineKeyboardButton(f'⏱ Delay: {delay}s', callback_data='settings#setdelay')],
+        [
+           InlineKeyboardButton('-5s', callback_data=f'settings#delayadj-{-5}'),
+           InlineKeyboardButton('-1s', callback_data=f'settings#delayadj-{-1}'),
+           InlineKeyboardButton('+1s', callback_data=f'settings#delayadj-1'),
+           InlineKeyboardButton('+5s', callback_data=f'settings#delayadj-5'),
+        ],
+        [InlineKeyboardButton(
+            f"🛡 Safe Mode: {'ON ✅' if safe else 'OFF ❌'}",
+            callback_data=f'settings#togglesafe-{not safe}'
+        )],
+        [
+           InlineKeyboardButton('Batch -5', callback_data=f'settings#batchadj-{-5}'),
+           InlineKeyboardButton(f'Batch: {batch}', callback_data='settings#noop'),
+           InlineKeyboardButton('Batch +5', callback_data=f'settings#batchadj-5'),
+        ],
+        [InlineKeyboardButton('↩ Back', callback_data='settings#main')],
+     ]
+     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+  elif type.startswith("togglesafe"):
+     new_val = type.split('-', 1)[1] == 'True'
+     await update_configs(user_id, 'safe_mode', new_val)
+     cfg = await get_configs(user_id)
+     delay = cfg.get('delay', 5)
+     safe = cfg.get('safe_mode', True)
+     batch = cfg.get('batch_size', 30)
+     text = (
+        "<b><u>🐢 RATE LIMIT / SAFE MODE</u></b>\n\n"
+        "These settings reduce ban risk when using a <b>Userbot</b> on private/restricted channels.\n\n"
+        f"• <b>Delay:</b> <code>{delay}s</code> between each message\n"
+        f"• <b>Safe Mode:</b> {'✅ ON' if safe else '❌ OFF'} (jitter + adaptive slowdown + rest pauses)\n"
+        f"• <b>Batch size:</b> <code>{batch}</code> (when Forward Tag is ON)\n\n"
+        "<i>Bots: 0.5–2s OK · Userbots: ≥4s + Safe Mode ON</i>"
+     )
+     buttons = [
+        [InlineKeyboardButton(f'⏱ Delay: {delay}s', callback_data='settings#setdelay')],
+        [
+           InlineKeyboardButton('-5s', callback_data=f'settings#delayadj-{-5}'),
+           InlineKeyboardButton('-1s', callback_data=f'settings#delayadj-{-1}'),
+           InlineKeyboardButton('+1s', callback_data=f'settings#delayadj-1'),
+           InlineKeyboardButton('+5s', callback_data=f'settings#delayadj-5'),
+        ],
+        [InlineKeyboardButton(
+            f"🛡 Safe Mode: {'ON ✅' if safe else 'OFF ❌'}",
+            callback_data=f'settings#togglesafe-{not safe}'
+        )],
+        [
+           InlineKeyboardButton('Batch -5', callback_data=f'settings#batchadj-{-5}'),
+           InlineKeyboardButton(f'Batch: {batch}', callback_data='settings#noop'),
+           InlineKeyboardButton('Batch +5', callback_data=f'settings#batchadj-5'),
+        ],
+        [InlineKeyboardButton('↩ Back', callback_data='settings#main')],
+     ]
+     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+  elif type.startswith("batchadj"):
+     delta = int(type.split('-', 1)[1])
+     cfg = await get_configs(user_id)
+     new_batch = max(5, min(80, int(cfg.get('batch_size', 30)) + delta))
+     await update_configs(user_id, 'batch_size', new_batch)
+     cfg = await get_configs(user_id)
+     delay = cfg.get('delay', 5)
+     safe = cfg.get('safe_mode', True)
+     batch = cfg.get('batch_size', 30)
+     text = (
+        "<b><u>🐢 RATE LIMIT / SAFE MODE</u></b>\n\n"
+        "These settings reduce ban risk when using a <b>Userbot</b> on private/restricted channels.\n\n"
+        f"• <b>Delay:</b> <code>{delay}s</code> between each message\n"
+        f"• <b>Safe Mode:</b> {'✅ ON' if safe else '❌ OFF'} (jitter + adaptive slowdown + rest pauses)\n"
+        f"• <b>Batch size:</b> <code>{batch}</code> (when Forward Tag is ON)\n\n"
+        "<i>Bots: 0.5–2s OK · Userbots: ≥4s + Safe Mode ON</i>"
+     )
+     buttons = [
+        [InlineKeyboardButton(f'⏱ Delay: {delay}s', callback_data='settings#setdelay')],
+        [
+           InlineKeyboardButton('-5s', callback_data=f'settings#delayadj-{-5}'),
+           InlineKeyboardButton('-1s', callback_data=f'settings#delayadj-{-1}'),
+           InlineKeyboardButton('+1s', callback_data=f'settings#delayadj-1'),
+           InlineKeyboardButton('+5s', callback_data=f'settings#delayadj-5'),
+        ],
+        [InlineKeyboardButton(
+            f"🛡 Safe Mode: {'ON ✅' if safe else 'OFF ❌'}",
+            callback_data=f'settings#togglesafe-{not safe}'
+        )],
+        [
+           InlineKeyboardButton('Batch -5', callback_data=f'settings#batchadj-{-5}'),
+           InlineKeyboardButton(f'Batch: {batch}', callback_data='settings#noop'),
+           InlineKeyboardButton('Batch +5', callback_data=f'settings#batchadj-5'),
+        ],
+        [InlineKeyboardButton('↩ Back', callback_data='settings#main')],
+     ]
+     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+  elif type == "noop":
+     await query.answer()
       
 def main_buttons():
   buttons = [[
@@ -413,6 +580,9 @@ def main_buttons():
                     callback_data=f'settings#filters'),
        InlineKeyboardButton('⏹ Bᴜᴛᴛᴏɴ',
                     callback_data=f'settings#button')
+       ],[
+       InlineKeyboardButton('🐢 Rate Limit / Safe Mode',
+                    callback_data='settings#ratelimit')
        ],[
        InlineKeyboardButton('Exᴛʀᴀ Sᴇᴛᴛɪɴɢs 🧪',
                     callback_data='settings#nextfilters')

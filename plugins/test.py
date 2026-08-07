@@ -2,6 +2,7 @@ import os
 import re 
 import sys
 import typing
+import random
 import asyncio 
 import logging 
 from database import db 
@@ -32,96 +33,100 @@ def get_file_unique_id(message):
 
 async def start_clone_bot(FwdBot, data=None):
    await FwdBot.start()
-   #
+
    async def iter_messages(
-      self, 
-      chat_id: Union[int, str], 
-      limit: int, 
+      self,
+      chat_id: Union[int, str],
+      limit: int,
       offset: int = 0,
       search: str = None,
       filter: "types.TypeMessagesFilter" = None,
       continuous: bool = False,
       skip_duplicate: Union[list, bool] = False
       ) -> Optional[AsyncGenerator["types.Message", None]]:
-        """Iterate through a chat sequentially."""
-        current = offset
+        """
+        Iterate message IDs sequentially from `offset` up to `limit` (inclusive).
+
+        - Always advances by the requested ID range so gaps (deleted msgs) never
+          cause later messages to be skipped.
+        - Stops cleanly when past `limit` or after consecutive empty batches
+          (end of chat), unless continuous=True.
+        """
+        BATCH = 100          # Telegram allows up to ~200; 100 is safer + faster
+        EMPTY_STOP = 3       # consecutive empty batches → end of chat
+        current = max(0, int(offset))
+        empty_streak = 0
+        end_id = int(limit) if (not continuous and limit and int(limit) > 0) else None
+
         while True:
-            # If continuous, we don't really have a limit, effectively infinite
-            # But we still use limit if provided to fetch batches
-            # If continuous=True, loop forever waiting for new messages
+            if end_id is not None and current > end_id:
+                return
 
-            # If batch fetch size is 200
-            new_diff = 200 # Default batch size
-
-            if not continuous and limit > 0:
-                new_diff = min(200, limit - current)
-                if new_diff <= 0:
+            # How many IDs to request this round
+            if end_id is not None:
+                remaining = end_id - current + 1
+                if remaining <= 0:
                     return
+                batch = min(BATCH, remaining)
+            else:
+                batch = BATCH
 
+            id_list = list(range(current, current + batch))
             try:
-                messages = await self.get_messages(chat_id, list(range(current, current+new_diff+1)))
+                messages = await self.get_messages(chat_id, id_list)
             except FloodWait as e:
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + random.uniform(1.5, 3.5))
                 continue
             except Exception as e:
                 print(f"Failed to fetch messages from {chat_id} (offset {current}): {e}")
-                messages = []
+                # Advance past this range so we don't loop forever on a bad offset
+                current += batch
+                empty_streak += 1
+                if empty_streak >= EMPTY_STOP and not continuous:
+                    return
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                continue
 
-            # Filter out None values (messages that don't exist yet)
-            valid_messages = [m for m in messages if m and not m.empty]
+            # Tiny pause between fetch batches (anti-pattern detection)
+            await asyncio.sleep(random.uniform(0.15, 0.6))
+
+            valid_messages = [m for m in messages if m is not None and not m.empty]
 
             if not valid_messages:
+                empty_streak += 1
+                current += batch
                 if continuous:
-                    # No new messages, wait and retry
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(8)
                     continue
-                else:
-                    # End of chat
+                if empty_streak >= EMPTY_STOP:
                     return
+                continue
+
+            empty_streak = 0
 
             for message in valid_messages:
+                # Respect upper bound even if batch overshot
+                if end_id is not None and message.id > end_id:
+                    return
+
                 if skip_duplicate and message.media:
                     file_unique_id = get_file_unique_id(message)
                     if file_unique_id:
                         dup_uri, target_chat = skip_duplicate
-                        is_dup = await db.is_duplicate_file(file_unique_id, target_chat, dup_uri)
+                        try:
+                            is_dup = await db.is_duplicate_file(
+                                file_unique_id, target_chat, dup_uri
+                            )
+                        except Exception:
+                            is_dup = False
                         if is_dup:
                             yield "DUPLICATE"
-                            current = max(current, message.id) + 1
                             continue
                 yield message
-                current = max(current, message.id) + 1
 
-            # If we got fewer messages than requested, and not continuous, it might be end?
-            # But we are iterating by ID range, so gaps are possible.
-            # We just increment current.
-            if not valid_messages and not continuous:
-                 return
+            # Always advance past the whole requested range (gaps are fine)
+            current += batch
 
-            # Optimization: if valid_messages is empty but we are in continuous mode, we handled it above.
-            # If valid_messages is NOT empty, we processed them.
-            # Update current to be next ID.
-
-            current = list(range(current, current+new_diff+1))[-1] + 1
-            # Wait, the range logic above: range(current, current+new_diff+1)
-            # If current=0, new_diff=200. range(0, 201). IDs 0..200.
-            # Next iteration should start at 201.
-            # So current += new_diff + 1?
-            # No, if we yield, we just continue loop.
-            # But we need to update 'current' for next batch.
-            # My previous logic: `current += 1` inside loop was weird because `messages` is a batch.
-
-            # Let's fix the batch logic properly
-            # The original code:
-            # messages = await self.get_messages(chat_id, list(range(current, current+new_diff+1)))
-            # for message in messages: yield message; current += 1
-            # This assumed sequential IDs and incrementing current.
-
-            # New logic:
-            # Just increment current by batch size at the end of loop
-            current += (new_diff + 1)
-
-   #
    FwdBot.iter_messages = iter_messages
    return FwdBot
 
@@ -233,7 +238,7 @@ async def get_configs(user_id):
                           
 async def update_configs(user_id, key, value):
   current = await db.get_configs(user_id)
-  if key in ['caption', 'duplicate', 'db_uri', 'forward_tag', 'protect', 'file_size', 'size_limit', 'extension', 'keywords', 'button']:
+  if key in ['caption', 'duplicate', 'db_uri', 'forward_tag', 'protect', 'file_size', 'size_limit', 'extension', 'keywords', 'button', 'delay', 'safe_mode', 'batch_size']:
      current[key] = value
   else: 
      current['filters'][key] = value

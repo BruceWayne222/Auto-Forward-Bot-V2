@@ -2,6 +2,7 @@ import os
 import sys 
 import math
 import time
+import random
 import asyncio 
 import logging
 from .utils import STS
@@ -18,6 +19,47 @@ CLIENT = CLIENT()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 TEXT = Translation.TEXT
+
+# ---------- Rate-limit helpers (fast but ban-safe) ----------
+_FLOOD_STREAK = {}   # user_id -> consecutive flood count
+_LAST_FLOOD = {}     # user_id -> timestamp of last FloodWait
+
+def _jitter(base: float, pct: float = 0.25) -> float:
+    """Return base ± pct random jitter (floor 0.35s)."""
+    spread = base * pct
+    return max(0.35, base + random.uniform(-spread, spread))
+
+async def smart_sleep(user_id: int, base_delay: float, safe_mode: bool, m=None, sts=None):
+    """
+    Sleep with light jitter. Adaptive slowdown only after real FloodWaits.
+    Occasional longer pauses only in safe_mode for userbots.
+    """
+    delay = float(base_delay)
+    streak = _FLOOD_STREAK.get(user_id, 0)
+
+    if streak > 0:
+        # Grow delay after floods, but cap the multiplier
+        delay *= min(1.0 + (streak * 0.4), 3.0)
+
+    if safe_mode and streak == 0:
+        # Light anti-pattern rest every ~60 successful forwards (userbots mainly)
+        total = sts.get('total_files') if sts else 0
+        if total and total % 60 == 0 and total > 0:
+            delay += random.uniform(6, 14)
+            if m and sts:
+                await edit(m, 'Progressing', int(delay), sts)
+
+    delay = _jitter(delay, 0.30 if safe_mode else 0.15)
+    await asyncio.sleep(delay)
+
+def note_flood(user_id: int):
+    _FLOOD_STREAK[user_id] = _FLOOD_STREAK.get(user_id, 0) + 1
+    _LAST_FLOOD[user_id] = time.time()
+
+def clear_flood_streak(user_id: int):
+    last = _LAST_FLOOD.get(user_id, 0)
+    if time.time() - last > 90:          # decay faster → recover speed sooner
+        _FLOOD_STREAK[user_id] = 0
 
 @Client.on_callback_query(filters.regex(r'^start_public'))
 async def pub_(bot, message):
@@ -58,116 +100,245 @@ async def pub_(bot, message):
     await db.add_frwd(user)
     await send(client, user, "<b>ғᴏʀᴡᴀʀᴅɪɴɢ sᴛᴀʀᴛᴇᴅ <a href=https://t.me/dev_gagan>Dev Gagan</a></b>")
     sts.add(time=True)
-    sleep = 1 if _bot['is_bot'] else 10
-    await msg_edit(m, "<code>Processing...</code>") 
+
+    # ----- Rate-limit settings (fast defaults, still ban-safe) -----
+    user_delay = data.get('delay') if isinstance(data, dict) else None
+    safe_mode = data.get('safe_mode', True) if isinstance(data, dict) else True
+    batch_size = data.get('batch_size', 25) if isinstance(data, dict) else 25
+    try:
+        batch_size = max(5, min(int(batch_size), 80))
+    except Exception:
+        batch_size = 25
+
+    is_bot_account = bool(_bot.get('is_bot'))
+
+    if user_delay is not None:
+        try:
+            base_sleep = max(0.5, float(user_delay))
+        except Exception:
+            base_sleep = 1.2 if is_bot_account else 6
+    else:
+        # Bots can be aggressive; userbots need breathing room
+        base_sleep = 1.2 if is_bot_account else 6
+
+    if safe_mode and not is_bot_account:
+        # Userbot + safe mode floor
+        base_sleep = max(base_sleep, 4)
+
+    # Parallel copy workers (only for non-forward_tag / copy mode)
+    # Bots: 4 concurrent, userbots: 2 concurrent → big speedup, low flood risk
+    copy_concurrency = 4 if is_bot_account else 2
+    if safe_mode and not is_bot_account:
+        copy_concurrency = 1
+
+    await msg_edit(
+        m,
+        f"<code>Processing… delay≈{base_sleep}s  safe={'ON' if safe_mode else 'OFF'}  "
+        f"batch={batch_size}  workers={copy_concurrency if not forward_tag else 1}</code>"
+    )
     temp.IS_FRWD_CHAT.append(i.TO)
     temp.lock[user] = locked = True
+    _FLOOD_STREAK[user] = 0
+
     if locked:
         try:
           MSG = []
-          pling=0
+          pling = 0
           await edit(m, 'Progressing', 10, sts)
-          print(f"Starting Forwarding Process... From :{sts.get('FROM')} To: {sts.get('TO')} Totel: {sts.get('limit')} stats : {sts.get('skip')})")
+          print(
+              f"Starting Forwarding… From:{sts.get('FROM')} To:{sts.get('TO')} "
+              f"Total:{sts.get('limit')} skip:{sts.get('skip')} "
+              f"delay={base_sleep}s safe={safe_mode} batch={batch_size}"
+          )
 
-          # Use getattr to safely check for 'continuous' attribute since old STS objects might not have it
           is_continuous = getattr(sts, 'continuous', False)
-
           skip_duplicate = data.get('skip_duplicate', False) if isinstance(data, dict) else False
+          disabled_types = data.get('filters', []) if isinstance(data, dict) else []
+
+          # Semaphore for parallel copy mode
+          sem = asyncio.Semaphore(copy_concurrency)
+          pending_tasks = set()
+
+          async def _bounded_copy(details):
+              async with sem:
+                  await copy(client, details, m, sts, user)
+                  sts.add('total_files')
+                  await smart_sleep(user, base_sleep, safe_mode, m, sts)
+
           async for message in client.iter_messages(
-            client,
-            chat_id=sts.get('FROM'), 
-            limit=int(sts.get('limit')), 
-            offset=int(sts.get('skip')) if sts.get('skip') else 0,
-            continuous=is_continuous,
-            skip_duplicate=skip_duplicate
-            ):
+              client,
+              chat_id=sts.get('FROM'),
+              limit=int(sts.get('limit')),
+              offset=int(sts.get('skip')) if sts.get('skip') else 0,
+              continuous=is_continuous,
+              skip_duplicate=skip_duplicate
+          ):
                 if await is_cancelled(client, user, m, sts):
-                   return
-                if pling %20 == 0: 
-                   await edit(m, 'Progressing', 10, sts)
+                    # drain pending
+                    if pending_tasks:
+                        await asyncio.gather(*pending_tasks, return_exceptions=True)
+                    return
+
                 pling += 1
+                if pling % 25 == 0:
+                    await edit(m, 'Progressing', 10, sts)
+
                 sts.add('fetched')
+                clear_flood_streak(user)
+
                 if message == "DUPLICATE":
-                   sts.add('duplicate')
-                   continue 
-                elif message == "FILTERED":
-                   sts.add('filtered')
-                   continue 
-                if message.empty or message.service:
-                   sts.add('deleted')
-                   continue
-                disabled_types = data.get('filters', []) if isinstance(data, dict) else []
+                    sts.add('duplicate')
+                    continue
+                if message == "FILTERED":
+                    sts.add('filtered')
+                    continue
+                if getattr(message, 'empty', False) or getattr(message, 'service', False):
+                    sts.add('deleted')
+                    continue
+
                 msg_type = message.media.value if message.media else "text"
                 if msg_type in disabled_types:
-                   sts.add('filtered')
-                   continue
+                    sts.add('filtered')
+                    continue
+
                 if forward_tag:
-                   MSG.append(message.id)
-                   notcompleted = len(MSG)
-                   completed = sts.get('total') - sts.get('fetched')
-                   if ( notcompleted >= 100 
-                        or completed <= 100): 
-                      await forward(client, MSG, m, sts, protect)
-                      sts.add('total_files', notcompleted)
-                      await asyncio.sleep(10)
-                      MSG = []
+                    MSG.append(message.id)
+                    if len(MSG) >= batch_size:
+                        await forward(client, MSG, m, sts, protect, user)
+                        sts.add('total_files', len(MSG))
+                        # Sleep once per batch (much faster than per-message)
+                        await smart_sleep(user, base_sleep * 1.5, safe_mode, m, sts)
+                        MSG = []
                 else:
-                   new_caption = custom_caption(message, caption)
-                   details = {"msg_id": message.id, "media": media(message), "caption": new_caption, 'button': button, "protect": protect}
-                   await copy(client, details, m, sts)
-                   sts.add('total_files')
-                   await asyncio.sleep(sleep) 
+                    new_caption = custom_caption(message, caption)
+                    details = {
+                        "msg_id": message.id,
+                        "media": media(message),
+                        "caption": new_caption,
+                        "button": button,
+                        "protect": protect,
+                    }
+                    if copy_concurrency <= 1:
+                        await _bounded_copy(details)
+                    else:
+                        task = asyncio.create_task(_bounded_copy(details))
+                        pending_tasks.add(task)
+                        task.add_done_callback(pending_tasks.discard)
+                        # Soft back-pressure so we don't queue thousands
+                        if len(pending_tasks) >= copy_concurrency * 3:
+                            done, pending_tasks = await asyncio.wait(
+                                pending_tasks, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            pending_tasks = set(pending_tasks)
+
+          # Flush remaining forward batch
+          if forward_tag and MSG:
+              await forward(client, MSG, m, sts, protect, user)
+              sts.add('total_files', len(MSG))
+
+          # Wait for any leftover parallel copies
+          if pending_tasks:
+              await asyncio.gather(*pending_tasks, return_exceptions=True)
+
         except Exception as e:
             await msg_edit(m, f'<b>ERROR:</b>\n<code>{e}</code>', wait=True)
-            temp.IS_FRWD_CHAT.remove(sts.TO)
+            try:
+                temp.IS_FRWD_CHAT.remove(sts.TO)
+            except ValueError:
+                pass
             return await stop(client, user)
-        temp.IS_FRWD_CHAT.remove(sts.TO)
+
+        try:
+            temp.IS_FRWD_CHAT.remove(sts.TO)
+        except ValueError:
+            pass
         await send(client, user, "<b>🎉 ғᴏʀᴡᴀᴅɪɴɢ ᴄᴏᴍᴘʟᴇᴛᴇᴅ 🥀 <a href=https://t.me/dev_gagan>SUPPORT</a>🥀</b>")
-        await edit(m, 'Completed', "completed", sts) 
+        await edit(m, 'Completed', "completed", sts)
         await stop(client, user)
             
-async def copy(bot, msg, m, sts):
-   try:                                  
-     if msg.get("media") and msg.get("caption"):
-        await bot.send_cached_media(
-              chat_id=sts.get('TO'),
-              file_id=msg.get("media"),
-              caption=msg.get("caption"),
-              reply_markup=msg.get('button'),
-              protect_content=msg.get("protect"))
-     else:
-        await bot.copy_message(
-              chat_id=sts.get('TO'),
-              from_chat_id=sts.get('FROM'),    
-              caption=msg.get("caption"),
-              message_id=msg.get("msg_id"),
-              reply_markup=msg.get('button'),
-              protect_content=msg.get("protect"))
-   except FloodWait as e:
-     await edit(m, 'Progressing', e.value, sts)
-     await asyncio.sleep(e.value)
-     await edit(m, 'Progressing', 10, sts)
-     await copy(bot, msg, m, sts)
-   except Exception as e:
-     # Improved error logging to debug "Not Forwarding" issues
-     print(f"Failed to copy message {msg.get('msg_id')}: {e}")
-     sts.add('deleted')
-        
-async def forward(bot, msg, m, sts, protect):
-   try:                             
-     await bot.forward_messages(
-           chat_id=sts.get('TO'),
-           from_chat_id=sts.get('FROM'), 
-           protect_content=protect,
-           message_ids=msg)
-   except FloodWait as e:
-     await edit(m, 'Progressing', e.value, sts)
-     await asyncio.sleep(e.value)
-     await edit(m, 'Progressing', 10, sts)
-     await forward(bot, msg, m, sts, protect)
-   except Exception as e:
-      print(f"Failed to forward messages {msg}: {e}")
-      sts.add('deleted')
+async def copy(bot, msg, m, sts, user_id=None, _retries=0):
+    """Copy / send one message. Retries on FloodWait and a few transient errors."""
+    MAX_RETRIES = 4
+    try:
+        if msg.get("media") and msg.get("caption") is not None:
+            await bot.send_cached_media(
+                chat_id=sts.get('TO'),
+                file_id=msg.get("media"),
+                caption=msg.get("caption"),
+                reply_markup=msg.get('button'),
+                protect_content=msg.get("protect"),
+            )
+        else:
+            await bot.copy_message(
+                chat_id=sts.get('TO'),
+                from_chat_id=sts.get('FROM'),
+                caption=msg.get("caption"),
+                message_id=msg.get("msg_id"),
+                reply_markup=msg.get('button'),
+                protect_content=msg.get("protect"),
+            )
+    except FloodWait as e:
+        if user_id is not None:
+            note_flood(user_id)
+        wait = e.value + random.uniform(1.0, 3.0)
+        await edit(m, 'Progressing', int(wait), sts)
+        await asyncio.sleep(wait)
+        await edit(m, 'Progressing', 10, sts)
+        if _retries < MAX_RETRIES:
+            return await copy(bot, msg, m, sts, user_id, _retries + 1)
+        print(f"copy gave up after FloodWaits msg={msg.get('msg_id')}")
+        sts.add('deleted')
+    except Exception as e:
+        err = str(e).lower()
+        # Retry a couple of times on transient network / timeout style errors
+        transient = any(x in err for x in (
+            "timeout", "timed out", "connection", "network", "internal server",
+            "writeerror", "readerror", "server closed"
+        ))
+        if transient and _retries < MAX_RETRIES:
+            await asyncio.sleep(1.5 + _retries)
+            return await copy(bot, msg, m, sts, user_id, _retries + 1)
+        print(f"Failed to copy message {msg.get('msg_id')}: {e}")
+        sts.add('deleted')
+
+
+async def forward(bot, msg, m, sts, protect, user_id=None, _retries=0):
+    """Forward a batch of message IDs. Retries on FloodWait."""
+    MAX_RETRIES = 4
+    try:
+        await bot.forward_messages(
+            chat_id=sts.get('TO'),
+            from_chat_id=sts.get('FROM'),
+            protect_content=protect,
+            message_ids=msg,
+        )
+    except FloodWait as e:
+        if user_id is not None:
+            note_flood(user_id)
+        wait = e.value + random.uniform(1.0, 3.0)
+        await edit(m, 'Progressing', int(wait), sts)
+        await asyncio.sleep(wait)
+        await edit(m, 'Progressing', 10, sts)
+        if _retries < MAX_RETRIES:
+            return await forward(bot, msg, m, sts, protect, user_id, _retries + 1)
+        print(f"forward gave up after FloodWaits ids={msg}")
+        sts.add('deleted', len(msg) if isinstance(msg, list) else 1)
+    except Exception as e:
+        err = str(e).lower()
+        transient = any(x in err for x in (
+            "timeout", "timed out", "connection", "network", "internal server"
+        ))
+        if transient and _retries < MAX_RETRIES:
+            await asyncio.sleep(1.5 + _retries)
+            return await forward(bot, msg, m, sts, protect, user_id, _retries + 1)
+        print(f"Failed to forward messages {msg}: {e}")
+        # Don't mark the whole batch as deleted on partial failure —
+        # try one-by-one as last resort
+        if isinstance(msg, list) and len(msg) > 1 and _retries == 0:
+            for mid in msg:
+                await forward(bot, [mid], m, sts, protect, user_id, _retries=1)
+        else:
+            sts.add('deleted', len(msg) if isinstance(msg, list) else 1)
 
 PROGRESS = """
 📈 Percetage: {0} %

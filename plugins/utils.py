@@ -46,5 +46,16 @@ class STS:
         button = parse_buttons(configs['button'] if configs['button'] else '')
         if configs['file_size'] != 0:
             size = [configs['file_size'], configs['size_limit']]
-        return bot, configs['caption'], configs['forward_tag'], {'chat_id': k.FROM, 'limit': k.limit, 'offset': k.skip, 'filters': filters,
-                'keywords': configs['keywords'], 'media_size': size, 'extensions': configs['extension'], 'skip_duplicate': duplicate}, configs['protect'], button
+        return bot, configs['caption'], configs['forward_tag'], {
+                'chat_id': k.FROM,
+                'limit': k.limit,
+                'offset': k.skip,
+                'filters': filters,
+                'keywords': configs['keywords'],
+                'media_size': size,
+                'extensions': configs['extension'],
+                'skip_duplicate': duplicate,
+                'delay': configs.get('delay', 5),
+                'safe_mode': configs.get('safe_mode', True),
+                'batch_size': configs.get('batch_size', 30),
+            }, configs['protect'], button
