@@ -97,6 +97,10 @@ class Database:
             'protect': None,
             'button': None,
             'db_uri': None,
+            # Rate-limit / anti-ban settings
+            'delay': 5,           # base seconds between each copy (balanced default)
+            'safe_mode': True,    # extra jitter + adaptive slowdown + rest pauses
+            'batch_size': 30,     # max messages per forward_messages batch
             'filters': {
                'poll': True,
                'text': True,
@@ -111,7 +115,12 @@ class Database:
         }
         user = await self.col.find_one({'id':int(id)})
         if user:
-            return user.get('configs', default)
+            configs = user.get('configs', default)
+            # Ensure new keys exist for older users
+            for key, val in default.items():
+                if key not in configs:
+                    configs[key] = val
+            return configs
         return default 
        
     async def add_bot(self, datas):
