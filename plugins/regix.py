@@ -5,6 +5,7 @@ import time
 import random
 import asyncio 
 import logging
+import tempfile
 from .utils import STS
 from database import db 
 from .test import CLIENT , start_clone_bot
@@ -256,9 +257,162 @@ async def pub_(bot, message):
         await edit(m, 'Completed', "completed", sts)
         await stop(client, user)
             
+async def _download_and_reupload(bot, msg, sts, m=None):
+    """
+    Fallback for restricted channels (CHAT_FORWARDS_RESTRICTED).
+    Downloads media with the userbot and re-uploads it to the target chat.
+    Shows live progress on the status message when possible.
+    """
+    msg_id = msg.get("msg_id")
+    caption = msg.get("caption")
+    button = msg.get("button")
+    protect = msg.get("protect", False)
+    from_chat = sts.get("FROM")
+    to_chat = sts.get("TO")
+
+    # Re-fetch the original message so we have full media attributes
+    try:
+        original = await bot.get_messages(from_chat, msg_id)
+    except Exception as e:
+        print(f"Could not re-fetch message {msg_id}: {e}")
+        raise
+
+    if original.empty or original.service:
+        raise ValueError("Message is empty or service message")
+
+    # Text-only message
+    if not original.media:
+        text_body = caption if caption is not None else (original.text.html if original.text else "")
+        if text_body:
+            await bot.send_message(
+                chat_id=to_chat,
+                text=text_body,
+                reply_markup=button,
+                protect_content=protect,
+                disable_web_page_preview=True,
+            )
+        return
+
+    # ---- progress helpers ----
+    last_pct = {"value": -1}
+    last_update = {"ts": 0.0}
+
+    async def _progress(current, total):
+        """Pyrogram download/upload progress callback – throttled UI updates."""
+        if not m or not total:
+            return
+        now = time.time()
+        pct = int(current * 100 / total) if total else 0
+        # Update at most every 1.5s or on ~5% steps / completion
+        if pct < last_pct["value"] + 5 and (now - last_update["ts"]) < 1.5 and pct < 100:
+            return
+        last_pct["value"] = pct
+        last_update["ts"] = now
+        try:
+            size_mb = total / (1024 * 1024)
+            cur_mb = current / (1024 * 1024)
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            await edit(m, f"Downloading {pct}%", 10, sts)
+            print(f"  ↓ msg {msg_id}: {cur_mb:.1f}/{size_mb:.1f} MB ({pct}%) [{bar}]")
+        except Exception:
+            pass
+
+    # Download media to a temporary file
+    tmp_dir = tempfile.mkdtemp(prefix="fwd_")
+    file_path = None
+    try:
+        if m:
+            try:
+                await edit(m, "Downloading…", 10, sts)
+            except Exception:
+                pass
+
+        file_path = await bot.download_media(
+            original,
+            file_name=os.path.join(tmp_dir, ""),
+            progress=_progress,
+        )
+        if not file_path or not os.path.exists(file_path):
+            raise FileNotFoundError("download_media returned no file")
+
+        # Prefer custom caption if provided, otherwise keep original HTML caption
+        send_caption = caption
+        if send_caption is None and original.caption:
+            send_caption = original.caption.html
+
+        media_type = original.media.value if original.media else None
+        kwargs = {
+            "chat_id": to_chat,
+            "caption": send_caption,
+            "reply_markup": button,
+            "protect_content": protect,
+        }
+
+        if m:
+            try:
+                await edit(m, "Uploading…", 10, sts)
+            except Exception:
+                pass
+        print(f"  ↑ msg {msg_id}: uploading ({media_type})…")
+
+        if media_type == "photo":
+            await bot.send_photo(photo=file_path, **kwargs)
+        elif media_type == "video":
+            await bot.send_video(video=file_path, **kwargs)
+        elif media_type == "animation":
+            await bot.send_animation(animation=file_path, **kwargs)
+        elif media_type == "audio":
+            await bot.send_audio(audio=file_path, **kwargs)
+        elif media_type == "voice":
+            await bot.send_voice(voice=file_path, **kwargs)
+        elif media_type == "video_note":
+            await bot.send_video_note(video_note=file_path, chat_id=to_chat, protect_content=protect)
+        elif media_type == "sticker":
+            await bot.send_sticker(sticker=file_path, chat_id=to_chat, protect_content=protect)
+        elif media_type == "document":
+            await bot.send_document(document=file_path, **kwargs)
+        else:
+            # Fallback – treat as document
+            await bot.send_document(document=file_path, **kwargs)
+
+        if m:
+            try:
+                await edit(m, "Progressing", 10, sts)
+            except Exception:
+                pass
+
+    finally:
+        # Always clean up temp files
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+            if os.path.isdir(tmp_dir):
+                os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+def _is_network_error(err: str) -> bool:
+    """Return True for typical network / timeout style errors."""
+    keys = (
+        "timeout", "timed out", "connection", "network", "internal server",
+        "writeerror", "readerror", "server closed", "broken pipe",
+        "connection reset", "connection aborted", "temporarily unavailable",
+        "name or service not known", "temporary failure", "ssl",
+        "httpx", "aiohttp", "clientconnector", "server disconnected",
+        "oserror", "errno 104", "errno 110", "errno 111",
+    )
+    return any(k in err for k in keys)
+
+
 async def copy(bot, msg, m, sts, user_id=None, _retries=0):
-    """Copy / send one message. Retries on FloodWait and a few transient errors."""
-    MAX_RETRIES = 4
+    """
+    Copy / send one message.
+    1) Fast path: send_cached_media / copy_message
+    2) On CHAT_FORWARDS_RESTRICTED → download + re-upload
+    3) Retries on FloodWait and network/timeout errors (with backoff)
+    """
+    MAX_RETRIES = 6
     try:
         if msg.get("media") and msg.get("caption") is not None:
             await bot.send_cached_media(
@@ -290,21 +444,65 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
         sts.add('deleted')
     except Exception as e:
         err = str(e).lower()
-        # Retry a couple of times on transient network / timeout style errors
-        transient = any(x in err for x in (
-            "timeout", "timed out", "connection", "network", "internal server",
-            "writeerror", "readerror", "server closed"
-        ))
-        if transient and _retries < MAX_RETRIES:
-            await asyncio.sleep(1.5 + _retries)
+
+        # Restricted-content channels – fall back to download + re-upload
+        if "chat_forwards_restricted" in err or "chat_send_media_forbidden" in err:
+            try:
+                print(f"Restricted content detected for msg {msg.get('msg_id')} – downloading & re-uploading…")
+                await _download_and_reupload(bot, msg, sts, m=m)
+                return
+            except FloodWait as fw:
+                if user_id is not None:
+                    note_flood(user_id)
+                wait = fw.value + random.uniform(1.0, 3.0)
+                await edit(m, 'Progressing', int(wait), sts)
+                await asyncio.sleep(wait)
+                if _retries < MAX_RETRIES:
+                    return await copy(bot, msg, m, sts, user_id, _retries + 1)
+                print(f"download/reupload gave up after FloodWaits msg={msg.get('msg_id')}")
+                sts.add('deleted')
+                return
+            except Exception as dl_err:
+                dl_err_s = str(dl_err).lower()
+                # Network errors during download/upload → retry whole copy with backoff
+                if _is_network_error(dl_err_s) and _retries < MAX_RETRIES:
+                    backoff = min(2 ** _retries + random.uniform(0.5, 2.0), 45)
+                    print(f"Network error on download/reupload msg={msg.get('msg_id')} "
+                          f"(try {_retries+1}/{MAX_RETRIES}), retry in {backoff:.1f}s: {dl_err}")
+                    try:
+                        await edit(m, f"Network retry {_retries+1}", int(backoff), sts)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(backoff)
+                    return await copy(bot, msg, m, sts, user_id, _retries + 1)
+                print(f"Failed to download/reupload message {msg.get('msg_id')}: {dl_err}")
+                sts.add('deleted')
+                return
+
+        # Network / timeout style errors on the fast path
+        if _is_network_error(err) and _retries < MAX_RETRIES:
+            backoff = min(2 ** _retries + random.uniform(0.5, 2.0), 45)
+            print(f"Network/timeout on copy msg={msg.get('msg_id')} "
+                  f"(try {_retries+1}/{MAX_RETRIES}), retry in {backoff:.1f}s: {e}")
+            try:
+                await edit(m, f"Network retry {_retries+1}", int(backoff), sts)
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
             return await copy(bot, msg, m, sts, user_id, _retries + 1)
+
         print(f"Failed to copy message {msg.get('msg_id')}: {e}")
         sts.add('deleted')
 
 
 async def forward(bot, msg, m, sts, protect, user_id=None, _retries=0):
-    """Forward a batch of message IDs. Retries on FloodWait."""
-    MAX_RETRIES = 4
+    """
+    Forward a batch of message IDs.
+    On CHAT_FORWARDS_RESTRICTED falls back to per-message copy
+    (which itself can download + re-upload).
+    Retries network/timeout errors with exponential backoff.
+    """
+    MAX_RETRIES = 6
     try:
         await bot.forward_messages(
             chat_id=sts.get('TO'),
@@ -325,12 +523,34 @@ async def forward(bot, msg, m, sts, protect, user_id=None, _retries=0):
         sts.add('deleted', len(msg) if isinstance(msg, list) else 1)
     except Exception as e:
         err = str(e).lower()
-        transient = any(x in err for x in (
-            "timeout", "timed out", "connection", "network", "internal server"
-        ))
-        if transient and _retries < MAX_RETRIES:
-            await asyncio.sleep(1.5 + _retries)
+
+        # Restricted channel → fall back to copy (download+reupload) path
+        if "chat_forwards_restricted" in err or "chat_send_media_forbidden" in err:
+            print(f"Restricted content on forward batch – switching to copy mode for ids={msg}")
+            ids = msg if isinstance(msg, list) else [msg]
+            for mid in ids:
+                details = {
+                    "msg_id": mid,
+                    "media": None,
+                    "caption": None,
+                    "button": None,
+                    "protect": protect,
+                }
+                await copy(bot, details, m, sts, user_id)
+            return
+
+        # Network / timeout → exponential backoff retry
+        if _is_network_error(err) and _retries < MAX_RETRIES:
+            backoff = min(2 ** _retries + random.uniform(0.5, 2.0), 45)
+            print(f"Network/timeout on forward ids={msg} "
+                  f"(try {_retries+1}/{MAX_RETRIES}), retry in {backoff:.1f}s: {e}")
+            try:
+                await edit(m, f"Network retry {_retries+1}", int(backoff), sts)
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
             return await forward(bot, msg, m, sts, protect, user_id, _retries + 1)
+
         print(f"Failed to forward messages {msg}: {e}")
         # Don't mark the whole batch as deleted on partial failure —
         # try one-by-one as last resort
