@@ -1,20 +1,20 @@
 import os
-import sys 
+import sys
 import math
 import time
 import random
-import asyncio 
+import asyncio
 import logging
 import tempfile
+import shutil
 from .utils import STS
-from database import db 
-from .test import CLIENT , start_clone_bot
+from database import db
+from .test import CLIENT, start_clone_bot
 from config import Config, temp
 from translation import Translation
-from pyrogram import Client, filters 
-#from pyropatch.utils import unpack_new_file_id
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified, RPCError
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message 
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
 
 CLIENT = CLIENT()
 logger = logging.getLogger(__name__)
@@ -126,10 +126,11 @@ async def pub_(bot, message):
         # Userbot + safe mode floor
         base_sleep = max(base_sleep, 4)
 
-    # Parallel copy workers (only for non-forward_tag / copy mode)
-    # Bots: 4 concurrent, userbots: 2 concurrent → big speedup, low flood risk
-    copy_concurrency = 4 if is_bot_account else 2
-    if safe_mode and not is_bot_account:
+    # Parallel copy workers.
+    # Restricted channels need download+reupload (heavy on disk/RAM) — keep concurrency low
+    # so Render doesn't OOM / hang. Fast path can be a bit higher.
+    copy_concurrency = 2 if is_bot_account else 1
+    if safe_mode:
         copy_concurrency = 1
 
     await msg_edit(
@@ -257,11 +258,16 @@ async def pub_(bot, message):
         await edit(m, 'Completed', "completed", sts)
         await stop(client, user)
             
+# Timeouts (seconds) so a stalled Telegram transfer can't freeze the whole job
+DOWNLOAD_TIMEOUT = 600   # 10 min
+UPLOAD_TIMEOUT = 600     # 10 min
+
+
 async def _download_and_reupload(bot, msg, sts, m=None):
     """
     Fallback for restricted channels (CHAT_FORWARDS_RESTRICTED).
     Downloads media with the userbot and re-uploads it to the target chat.
-    Shows live progress on the status message when possible.
+    Hard timeouts prevent silent hangs (common cause of "forwarding stopped").
     """
     msg_id = msg.get("msg_id")
     caption = msg.get("caption")
@@ -270,9 +276,10 @@ async def _download_and_reupload(bot, msg, sts, m=None):
     from_chat = sts.get("FROM")
     to_chat = sts.get("TO")
 
-    # Re-fetch the original message so we have full media attributes
     try:
-        original = await bot.get_messages(from_chat, msg_id)
+        original = await asyncio.wait_for(
+            bot.get_messages(from_chat, msg_id), timeout=60
+        )
     except Exception as e:
         print(f"Could not re-fetch message {msg_id}: {e}")
         raise
@@ -280,7 +287,6 @@ async def _download_and_reupload(bot, msg, sts, m=None):
     if original.empty or original.service:
         raise ValueError("Message is empty or service message")
 
-    # Text-only message
     if not original.media:
         text_body = caption if caption is not None else (original.text.html if original.text else "")
         if text_body:
@@ -293,18 +299,16 @@ async def _download_and_reupload(bot, msg, sts, m=None):
             )
         return
 
-    # ---- progress helpers ----
     last_pct = {"value": -1}
     last_update = {"ts": 0.0}
+    phase = {"name": "↓"}
 
     async def _progress(current, total):
-        """Pyrogram download/upload progress callback – throttled UI updates."""
-        if not m or not total:
+        if not total:
             return
         now = time.time()
         pct = int(current * 100 / total) if total else 0
-        # Update at most every 1.5s or on ~5% steps / completion
-        if pct < last_pct["value"] + 5 and (now - last_update["ts"]) < 1.5 and pct < 100:
+        if pct < last_pct["value"] + 5 and (now - last_update["ts"]) < 2.0 and pct < 100:
             return
         last_pct["value"] = pct
         last_update["ts"] = now
@@ -312,12 +316,13 @@ async def _download_and_reupload(bot, msg, sts, m=None):
             size_mb = total / (1024 * 1024)
             cur_mb = current / (1024 * 1024)
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            await edit(m, f"Downloading {pct}%", 10, sts)
-            print(f"  ↓ msg {msg_id}: {cur_mb:.1f}/{size_mb:.1f} MB ({pct}%) [{bar}]")
+            label = "Downloading" if phase["name"] == "↓" else "Uploading"
+            if m:
+                await edit(m, f"{label} {pct}%", 10, sts)
+            print(f"  {phase['name']} msg {msg_id}: {cur_mb:.1f}/{size_mb:.1f} MB ({pct}%) [{bar}]")
         except Exception:
             pass
 
-    # Download media to a temporary file
     tmp_dir = tempfile.mkdtemp(prefix="fwd_")
     file_path = None
     try:
@@ -327,15 +332,24 @@ async def _download_and_reupload(bot, msg, sts, m=None):
             except Exception:
                 pass
 
-        file_path = await bot.download_media(
-            original,
-            file_name=os.path.join(tmp_dir, ""),
-            progress=_progress,
-        )
+        phase["name"] = "↓"
+        try:
+            file_path = await asyncio.wait_for(
+                bot.download_media(
+                    original,
+                    file_name=os.path.join(tmp_dir, ""),
+                    progress=_progress,
+                ),
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Download timed out after {DOWNLOAD_TIMEOUT}s for msg {msg_id}"
+            )
+
         if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("download_media returned no file")
 
-        # Prefer custom caption if provided, otherwise keep original HTML caption
         send_caption = caption
         if send_caption is None and original.caption:
             send_caption = original.caption.html
@@ -346,6 +360,7 @@ async def _download_and_reupload(bot, msg, sts, m=None):
             "caption": send_caption,
             "reply_markup": button,
             "protect_content": protect,
+            "progress": _progress,
         }
 
         if m:
@@ -353,28 +368,40 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 await edit(m, "Uploading…", 10, sts)
             except Exception:
                 pass
+        phase["name"] = "↑"
+        last_pct["value"] = -1
         print(f"  ↑ msg {msg_id}: uploading ({media_type})…")
 
-        if media_type == "photo":
-            await bot.send_photo(photo=file_path, **kwargs)
-        elif media_type == "video":
-            await bot.send_video(video=file_path, **kwargs)
-        elif media_type == "animation":
-            await bot.send_animation(animation=file_path, **kwargs)
-        elif media_type == "audio":
-            await bot.send_audio(audio=file_path, **kwargs)
-        elif media_type == "voice":
-            await bot.send_voice(voice=file_path, **kwargs)
-        elif media_type == "video_note":
-            await bot.send_video_note(video_note=file_path, chat_id=to_chat, protect_content=protect)
-        elif media_type == "sticker":
-            await bot.send_sticker(sticker=file_path, chat_id=to_chat, protect_content=protect)
-        elif media_type == "document":
-            await bot.send_document(document=file_path, **kwargs)
-        else:
-            # Fallback – treat as document
-            await bot.send_document(document=file_path, **kwargs)
+        async def _do_upload():
+            if media_type == "photo":
+                await bot.send_photo(photo=file_path, **kwargs)
+            elif media_type == "video":
+                await bot.send_video(video=file_path, **kwargs)
+            elif media_type == "animation":
+                await bot.send_animation(animation=file_path, **kwargs)
+            elif media_type == "audio":
+                await bot.send_audio(audio=file_path, **kwargs)
+            elif media_type == "voice":
+                await bot.send_voice(voice=file_path, **kwargs)
+            elif media_type == "video_note":
+                await bot.send_video_note(
+                    video_note=file_path, chat_id=to_chat, protect_content=protect
+                )
+            elif media_type == "sticker":
+                await bot.send_sticker(
+                    sticker=file_path, chat_id=to_chat, protect_content=protect
+                )
+            else:
+                await bot.send_document(document=file_path, **kwargs)
 
+        try:
+            await asyncio.wait_for(_do_upload(), timeout=UPLOAD_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Upload timed out after {UPLOAD_TIMEOUT}s for msg {msg_id}"
+            )
+
+        print(f"  ✓ msg {msg_id}: done ({media_type})")
         if m:
             try:
                 await edit(m, "Progressing", 10, sts)
@@ -382,13 +409,10 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 pass
 
     finally:
-        # Always clean up temp files
         try:
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
             if os.path.isdir(tmp_dir):
-                os.rmdir(tmp_dir)
-        except OSError:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
             pass
 
 
@@ -408,29 +432,43 @@ def _is_network_error(err: str) -> bool:
 async def copy(bot, msg, m, sts, user_id=None, _retries=0):
     """
     Copy / send one message.
-    1) Fast path: send_cached_media / copy_message
+    1) Fast path: send_cached_media / copy_message (with timeout)
     2) On CHAT_FORWARDS_RESTRICTED → download + re-upload
     3) Retries on FloodWait and network/timeout errors (with backoff)
     """
     MAX_RETRIES = 6
+    FAST_TIMEOUT = 120  # seconds for non-download copy path
     try:
         if msg.get("media") and msg.get("caption") is not None:
-            await bot.send_cached_media(
-                chat_id=sts.get('TO'),
-                file_id=msg.get("media"),
-                caption=msg.get("caption"),
-                reply_markup=msg.get('button'),
-                protect_content=msg.get("protect"),
+            await asyncio.wait_for(
+                bot.send_cached_media(
+                    chat_id=sts.get('TO'),
+                    file_id=msg.get("media"),
+                    caption=msg.get("caption"),
+                    reply_markup=msg.get('button'),
+                    protect_content=msg.get("protect"),
+                ),
+                timeout=FAST_TIMEOUT,
             )
         else:
-            await bot.copy_message(
-                chat_id=sts.get('TO'),
-                from_chat_id=sts.get('FROM'),
-                caption=msg.get("caption"),
-                message_id=msg.get("msg_id"),
-                reply_markup=msg.get('button'),
-                protect_content=msg.get("protect"),
+            await asyncio.wait_for(
+                bot.copy_message(
+                    chat_id=sts.get('TO'),
+                    from_chat_id=sts.get('FROM'),
+                    caption=msg.get("caption"),
+                    message_id=msg.get("msg_id"),
+                    reply_markup=msg.get('button'),
+                    protect_content=msg.get("protect"),
+                ),
+                timeout=FAST_TIMEOUT,
             )
+    except asyncio.TimeoutError:
+        print(f"Fast-path copy timed out msg={msg.get('msg_id')} (try {_retries+1})")
+        if _retries < MAX_RETRIES:
+            await asyncio.sleep(2 + _retries)
+            return await copy(bot, msg, m, sts, user_id, _retries + 1)
+        sts.add('deleted')
+        return
     except FloodWait as e:
         if user_id is not None:
             note_flood(user_id)
@@ -686,10 +724,34 @@ def retry_btn(id):
 
 @Client.on_callback_query(filters.regex(r'^terminate_frwd$'))
 async def terminate_frwding(bot, m):
-    user_id = m.from_user.id 
+    user_id = m.from_user.id
     temp.lock[user_id] = False
-    temp.CANCEL[user_id] = True 
+    temp.CANCEL[user_id] = True
     await m.answer("Forwarding cancelled !", show_alert=True)
+
+
+@Client.on_message(filters.private & filters.command(["unlock", "forceunlock"]))
+async def force_unlock(bot, message):
+    """Clear a stuck lock so /fwd can start again without restarting the service."""
+    user_id = message.from_user.id
+    was_locked = bool(temp.lock.get(user_id))
+    temp.lock[user_id] = False
+    temp.CANCEL[user_id] = True
+    # Also free any target chat marked as busy
+    try:
+        # Remove all entries belonging to this user is hard; clear the list if only one task
+        if hasattr(temp, "IS_FRWD_CHAT") and temp.IS_FRWD_CHAT:
+            temp.IS_FRWD_CHAT.clear()
+    except Exception:
+        pass
+    if was_locked:
+        await message.reply(
+            "<b>✅ Lock cleared.</b>\nYou can start a new <code>/fwd</code> now."
+        )
+    else:
+        await message.reply(
+            "<b>No active lock found.</b>\nYou can use <code>/fwd</code> normally."
+        )
           
 @Client.on_callback_query(filters.regex(r'^fwrdstatus'))
 async def status_msg(bot, msg):
