@@ -67,71 +67,118 @@ async def pub_(bot, message):
     user = message.from_user.id
     temp.CANCEL[user] = False
     frwd_id = message.data.split("_")[2]
-    if temp.lock.get(user) and str(temp.lock.get(user))=="True":
-      return await message.answer("please wait until previous task complete", show_alert=True)
+
+    if temp.lock.get(user) and str(temp.lock.get(user)) == "True":
+        try:
+            return await message.answer("please wait until previous task complete", show_alert=True)
+        except Exception:
+            return
     sts = STS(frwd_id)
     if not sts.verify():
-      await message.answer("your are clicking on my old button", show_alert=True)
-      return await message.message.delete()
+        try:
+            await message.answer("old button — run /fwd again", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await message.message.delete()
+        except Exception:
+            pass
+        return
     i = sts.get(full=True)
     if i.TO in temp.IS_FRWD_CHAT:
-      return await message.answer("In Target chat a task is progressing. please wait until task complete", show_alert=True)
-    m = await msg_edit(message.message, "<code>verifying your data's, please wait.</code>")
+        try:
+            return await message.answer(
+                "Target chat busy — wait until current task finishes",
+                show_alert=True,
+            )
+        except Exception:
+            return
+
+    # Answer callback so Telegram stops the loading spinner
     try:
-      _bot, caption, forward_tag, data, protect, button = await sts.get_data(user)
+        await message.answer("Starting…")
+    except Exception:
+        pass
+
+    m = await msg_edit(message.message, "<code>① Loading settings from database…</code>")
+    print(f"[fwd] user={user} step=get_data")
+    try:
+        _bot, caption, forward_tag, data, protect, button = await asyncio.wait_for(
+            sts.get_data(user), timeout=20
+        )
+    except asyncio.TimeoutError:
+        return await msg_edit(
+            m,
+            "<b>Database timeout (20s).</b>\nCheck <code>DATABASE</code> URI on Render.\nThen /unlock and /fwd again.",
+            wait=True,
+        )
     except Exception as e:
-      return await msg_edit(m, f"<b>DB error:</b>\n<code>{e}</code>", wait=True)
+        print(f"[fwd] get_data error: {e}")
+        return await msg_edit(m, f"<b>DB error:</b>\n<code>{e}</code>", wait=True)
+
     if not _bot:
-      return await msg_edit(m, "<code>You didn't added any bot. Please add a bot using /settings !</code>", wait=True)
+        return await msg_edit(
+            m,
+            "<code>You didn't add any bot. Please add a bot using /settings !</code>",
+            wait=True,
+        )
 
-    await msg_edit(m, "<code>Starting client… (max 45s)</code>")
-    try:
-      client = await start_clone_bot(CLIENT.client(_bot))
-    except Exception as e:
-      err = str(e)
-      print(f"Client start failed for user {user}: {err}")
-      return await msg_edit(
+    await msg_edit(
         m,
-        f"<b>Failed to start bot/userbot:</b>\n<code>{err}</code>\n\n"
-        f"<b>Fix:</b>\n"
-        f"• /settings → remove bot/userbot → add again\n"
-        f"• Userbot: generate a fresh session string\n"
-        f"• Check API_ID / API_HASH on Render\n"
-        f"• Then send /unlock and retry",
-        retry_btn(frwd_id),
-        True,
-      )
+        f"<code>② Starting {'bot' if _bot.get('is_bot') else 'userbot'} client… (max 45s)</code>",
+    )
+    print(f"[fwd] user={user} step=start_client is_bot={_bot.get('is_bot')}")
+    try:
+        client = await start_clone_bot(CLIENT.client(_bot))
+    except Exception as e:
+        err = str(e)
+        print(f"[fwd] Client start failed for user {user}: {err}")
+        return await msg_edit(
+            m,
+            f"<b>Failed to start bot/userbot:</b>\n<code>{err}</code>\n\n"
+            f"<b>Fix:</b>\n"
+            f"• /settings → remove bot/userbot → add again\n"
+            f"• Userbot: generate a fresh session string\n"
+            f"• Check API_ID / API_HASH on Render\n"
+            f"• Then send /unlock and retry",
+            retry_btn(frwd_id),
+            True,
+        )
+    print(f"[fwd] user={user} step=client_ok")
 
-    await msg_edit(m, "<code>Checking source chat…</code>")
+    await msg_edit(m, "<code>③ Checking source chat…</code>")
+    print(f"[fwd] user={user} step=check_source from={sts.get('FROM')}")
     try:
-      await asyncio.wait_for(client.get_messages(sts.get("FROM"), 1), timeout=30)
+        await asyncio.wait_for(client.get_messages(sts.get("FROM"), 1), timeout=30)
     except Exception as e:
-      print(f"Source check failed: {e}")
-      await msg_edit(
-        m,
-        f"**Source chat may be private / restricted.**\n"
-        f"Use a userbot (must be a member) or make your "
-        f"[Bot](t.me/{_bot.get('username', '')}) admin there.\n\n"
-        f"<code>{e}</code>",
-        retry_btn(frwd_id),
-        True,
-      )
-      return await stop(client, user)
+        print(f"[fwd] Source check failed: {e}")
+        await msg_edit(
+            m,
+            f"**Source chat may be private / restricted.**\n"
+            f"Use a userbot (must be a member) or make your "
+            f"[Bot](t.me/{_bot.get('username', '')}) admin there.\n\n"
+            f"<code>{e}</code>",
+            retry_btn(frwd_id),
+            True,
+        )
+        return await stop(client, user)
 
-    await msg_edit(m, "<code>Checking target chat…</code>")
+    await msg_edit(m, "<code>④ Checking target chat…</code>")
+    print(f"[fwd] user={user} step=check_target to={i.TO}")
     try:
-      k = await asyncio.wait_for(client.send_message(i.TO, "Testing"), timeout=30)
-      await k.delete()
+        k = await asyncio.wait_for(client.send_message(i.TO, "Testing"), timeout=30)
+        await k.delete()
     except Exception as e:
-      print(f"Target check failed: {e}")
-      await msg_edit(
-        m,
-        f"**Make your [UserBot / Bot](t.me/{_bot.get('username', '')}) admin in the target chat** "
-        f"with post permission.\n\n<code>{e}</code>",
-        retry_btn(frwd_id),
-        True,
-      )
-      return await stop(client, user)
+        print(f"[fwd] Target check failed: {e}")
+        await msg_edit(
+            m,
+            f"**Make your [UserBot / Bot](t.me/{_bot.get('username', '')}) admin in the target chat** "
+            f"with post permission.\n\n<code>{e}</code>",
+            retry_btn(frwd_id),
+            True,
+        )
+        return await stop(client, user)
+    print(f"[fwd] user={user} step=checks_ok — starting forward")
     temp.forwardings += 1
     await db.add_frwd(user)
     await send(client, user, "<b>ғᴏʀᴡᴀʀᴅɪɴɢ sᴛᴀʀᴛᴇᴅ <a href=https://t.me/dev_gagan>Dev Gagan</a></b>")
