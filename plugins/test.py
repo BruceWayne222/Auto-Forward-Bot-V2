@@ -32,7 +32,16 @@ def get_file_unique_id(message):
    return getattr(media, 'file_unique_id', None) if media else None
 
 async def start_clone_bot(FwdBot, data=None):
-   await FwdBot.start()
+   # Hard timeout so a dead/slow session can't freeze on "verifying your data's..."
+   try:
+      await asyncio.wait_for(FwdBot.start(), timeout=45)
+   except asyncio.TimeoutError:
+      raise TimeoutError(
+         "Client start timed out (45s). Session may be invalid, banned, or Telegram is unreachable. "
+         "Try /settings → remove bot/userbot → add again. For userbot, generate a fresh session."
+      )
+   except Exception as e:
+      raise type(e)(f"Failed to start client: {e}") from e
 
    async def iter_messages(
       self,

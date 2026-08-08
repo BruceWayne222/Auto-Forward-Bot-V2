@@ -77,26 +77,61 @@ async def pub_(bot, message):
     if i.TO in temp.IS_FRWD_CHAT:
       return await message.answer("In Target chat a task is progressing. please wait until task complete", show_alert=True)
     m = await msg_edit(message.message, "<code>verifying your data's, please wait.</code>")
-    _bot, caption, forward_tag, data, protect, button = await sts.get_data(user)
+    try:
+      _bot, caption, forward_tag, data, protect, button = await sts.get_data(user)
+    except Exception as e:
+      return await msg_edit(m, f"<b>DB error:</b>\n<code>{e}</code>", wait=True)
     if not _bot:
       return await msg_edit(m, "<code>You didn't added any bot. Please add a bot using /settings !</code>", wait=True)
+
+    await msg_edit(m, "<code>Starting client… (max 45s)</code>")
     try:
       client = await start_clone_bot(CLIENT.client(_bot))
-    except Exception as e:  
-      return await m.edit(e)
-    await msg_edit(m, "<code>processing..</code>")
-    try: 
-       # Just check if we can access messages. If continuous, limit might be huge.
-       await client.get_messages(sts.get("FROM"), 1)
-    except:
-       await msg_edit(m, f"**Source chat may be a private channel / group. Use userbot (user must be member over there) or  if Make Your [Bot](t.me/{_bot['username']}) an admin over there**", retry_btn(frwd_id), True)
-       return await stop(client, user)
+    except Exception as e:
+      err = str(e)
+      print(f"Client start failed for user {user}: {err}")
+      return await msg_edit(
+        m,
+        f"<b>Failed to start bot/userbot:</b>\n<code>{err}</code>\n\n"
+        f"<b>Fix:</b>\n"
+        f"• /settings → remove bot/userbot → add again\n"
+        f"• Userbot: generate a fresh session string\n"
+        f"• Check API_ID / API_HASH on Render\n"
+        f"• Then send /unlock and retry",
+        retry_btn(frwd_id),
+        True,
+      )
+
+    await msg_edit(m, "<code>Checking source chat…</code>")
     try:
-       k = await client.send_message(i.TO, "Testing")
-       await k.delete()
-    except:
-       await msg_edit(m, f"**Please Make Your [UserBot / Bot](t.me/{_bot['username']}) Admin In Target Channel With Full Permissions**", retry_btn(frwd_id), True)
-       return await stop(client, user)
+      await asyncio.wait_for(client.get_messages(sts.get("FROM"), 1), timeout=30)
+    except Exception as e:
+      print(f"Source check failed: {e}")
+      await msg_edit(
+        m,
+        f"**Source chat may be private / restricted.**\n"
+        f"Use a userbot (must be a member) or make your "
+        f"[Bot](t.me/{_bot.get('username', '')}) admin there.\n\n"
+        f"<code>{e}</code>",
+        retry_btn(frwd_id),
+        True,
+      )
+      return await stop(client, user)
+
+    await msg_edit(m, "<code>Checking target chat…</code>")
+    try:
+      k = await asyncio.wait_for(client.send_message(i.TO, "Testing"), timeout=30)
+      await k.delete()
+    except Exception as e:
+      print(f"Target check failed: {e}")
+      await msg_edit(
+        m,
+        f"**Make your [UserBot / Bot](t.me/{_bot.get('username', '')}) admin in the target chat** "
+        f"with post permission.\n\n<code>{e}</code>",
+        retry_btn(frwd_id),
+        True,
+      )
+      return await stop(client, user)
     temp.forwardings += 1
     await db.add_frwd(user)
     await send(client, user, "<b>ғᴏʀᴡᴀʀᴅɪɴɢ sᴛᴀʀᴛᴇᴅ <a href=https://t.me/dev_gagan>Dev Gagan</a></b>")
