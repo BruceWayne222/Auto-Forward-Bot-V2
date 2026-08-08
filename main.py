@@ -102,17 +102,44 @@ async def ping_server():
             logging.error(f"Self-ping failed: {e}")
 
 async def main():
-    bot = Bot()
-    await bot.start()
+    # Bind HTTP port FIRST so Render detects an open port quickly.
+    # (If bot.start() runs first, DB/restart messages can delay >30s → "No open ports")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%I:%M:%S %p",
+    )
+    try:
+        await web_server()
+    except Exception as e:
+        logging.error(f"Web server failed to start: {e}")
+        # Continue anyway — bot can still work as a background worker
 
-    # Start web server
-    await web_server()
-
-    # Start self-ping task
     asyncio.create_task(ping_server())
 
+    bot = Bot()
+    try:
+        await bot.start()
+    except Exception as e:
+        logging.error(f"Bot failed to start: {e}")
+        import traceback
+        traceback.print_exc()
+        # Keep process alive so Render doesn't loop-crash; web health still works
+        while True:
+            await asyncio.sleep(3600)
+
     await idle()
-    await bot.stop()
+    try:
+        await bot.stop()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.error(f"Fatal main error: {e}")
+        raise
