@@ -38,8 +38,8 @@
       "description": "Type Of filters (document , audio , photo , video , animation)",
       "value": "document"
     },
-    "DATABASE_URI": {
-      "description": "pyrogram string Seccion - https://replit.com/@JijinR/PyroSessionString?v=1",", 
+    "DATABASE": {
+      "description": "pyrogram string Seccion - https://replit.com/@JijinR/PyroSessionString?v=1", 
       "value": ""
     }
   },

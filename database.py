@@ -11,7 +11,13 @@ async def mongodb_version():
 class Database:
     
     def __init__(self, uri, database_name):
-        self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+        self._client = motor.motor_asyncio.AsyncIOMotorClient(
+            uri,
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=8000,
+            socketTimeoutMS=15000,
+            heartbeatFrequencyMS=10000,
+        )
         self.db = self._client[database_name]
         self.bot = self.db.bots
         self.col = self.db.users
