@@ -194,22 +194,65 @@ class Database:
        return client["AutoForwardBot"]["duplicates"]
 
     async def is_duplicate_file(self, file_unique_id, chat_id, dup_uri=None):
-       """Atomically check whether file_unique_id has already been forwarded to
-       chat_id. Records it the first time it's seen so later calls detect it.
-       Returns True if this is a duplicate, False if it's new."""
+       """Return True if this file was already successfully forwarded to chat_id.
+       Does NOT insert — call mark_file_forwarded() only after a successful send."""
        if not file_unique_id:
           return False
        try:
           collection = self._get_dup_collection(dup_uri)
-          existing = await collection.find_one_and_update(
-             {"chat_id": int(chat_id), "file_id": file_unique_id},
-             {"$setOnInsert": {"chat_id": int(chat_id), "file_id": file_unique_id}},
-             upsert=True
+          existing = await collection.find_one(
+             {"chat_id": int(chat_id), "file_id": file_unique_id}
           )
           return existing is not None
        except Exception as e:
           print(f"[duplicate-check] failed, allowing message through: {e}")
           return False
+
+    async def mark_file_forwarded(self, file_unique_id, chat_id, dup_uri=None):
+       """Record a file as successfully forwarded so future runs skip it."""
+       if not file_unique_id:
+          return
+       try:
+          collection = self._get_dup_collection(dup_uri)
+          await collection.update_one(
+             {"chat_id": int(chat_id), "file_id": file_unique_id},
+             {"$setOnInsert": {
+                "chat_id": int(chat_id),
+                "file_id": file_unique_id,
+                "ts": __import__("time").time(),
+             }},
+             upsert=True,
+          )
+       except Exception as e:
+          print(f"[duplicate-mark] failed: {e}")
+
+    async def mark_files_bulk(self, file_unique_ids, chat_id, dup_uri=None):
+       """Bulk-insert many file ids (used when indexing the target chat)."""
+       ids = [fid for fid in file_unique_ids if fid]
+       if not ids:
+          return 0
+       try:
+          collection = self._get_dup_collection(dup_uri)
+          import time as _t
+          ops = []
+          from pymongo import UpdateOne
+          for fid in ids:
+             ops.append(UpdateOne(
+                {"chat_id": int(chat_id), "file_id": fid},
+                {"$setOnInsert": {
+                   "chat_id": int(chat_id),
+                   "file_id": fid,
+                   "ts": _t.time(),
+                }},
+                upsert=True,
+             ))
+          if ops:
+             result = await collection.bulk_write(ops, ordered=False)
+             return (result.upserted_count or 0) + (result.modified_count or 0)
+          return 0
+       except Exception as e:
+          print(f"[duplicate-bulk] failed: {e}")
+          return 0
 
     async def clear_duplicate_history(self, chat_id, dup_uri=None):
        collection = self._get_dup_collection(dup_uri)
