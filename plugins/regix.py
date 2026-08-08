@@ -325,50 +325,96 @@ DOWNLOAD_TIMEOUT = 600   # 10 min
 UPLOAD_TIMEOUT = 600     # 10 min
 
 
-async def index_target_chat(client, target_chat, dup_uri, status_msg=None, sts=None, max_scan=8000):
+async def index_target_chat(client, target_chat, dup_uri, status_msg=None, sts=None, max_scan=10000):
     """
-    Scan the target chat for media already present and record their
-    file_unique_id so the forward loop auto-skips them.
-    Returns how many unique media files were indexed.
+    Fast scan of target chat for media already present.
+    - Minimal UI updates (time-based, not per-N messages)
+    - Large bulk DB writes
+    - Overlaps next Telegram fetch with DB write
+    Returns number of messages scanned.
     """
     from .test import get_file_unique_id
 
+    FLUSH_AT = 1500          # media ids per bulk write
+    UI_EVERY_SECS = 3.0      # don't spam Telegram with edit()
     collected = []
     scanned = 0
+    media_total = 0
+    pending_writes = set()
+    last_ui = 0.0
+
+    async def _flush(batch):
+        if not batch:
+            return
+        try:
+            await db.mark_files_bulk(batch, target_chat, dup_uri)
+        except Exception as e:
+            print(f"[index] bulk write error: {e}")
+
+    def _schedule_flush():
+        nonlocal collected, media_total
+        if not collected:
+            return
+        batch = collected
+        collected = []
+        media_total += len(batch)
+        task = asyncio.create_task(_flush(batch))
+        pending_writes.add(task)
+        task.add_done_callback(pending_writes.discard)
+
     try:
         if status_msg and sts:
             try:
                 await edit(status_msg, "Indexing target…", 10, sts)
             except Exception:
                 pass
-        print(f"Indexing target chat {target_chat} for already-uploaded files…")
+        print(f"Indexing target {target_chat} (max {max_scan})…")
+        t0 = time.time()
+
         async for msg in client.get_chat_history(target_chat, limit=max_scan):
             scanned += 1
-            uid = get_file_unique_id(msg)
-            if uid:
-                collected.append(uid)
-            if scanned % 200 == 0:
-                print(f"  indexed {scanned} msgs, {len(collected)} media so far…")
+            # Fast path: only touch media messages
+            if msg.media:
+                uid = get_file_unique_id(msg)
+                if uid:
+                    collected.append(uid)
+                    if len(collected) >= FLUSH_AT:
+                        _schedule_flush()
+
+            # UI / log at most every UI_EVERY_SECS
+            now = time.time()
+            if now - last_ui >= UI_EVERY_SECS:
+                last_ui = now
+                rate = scanned / max(now - t0, 0.1)
+                print(f"  index: {scanned} msgs ({rate:.0f}/s), media buffered={len(collected)}")
                 if status_msg and sts:
                     try:
-                        await edit(status_msg, f"Indexing {scanned}…", 10, sts)
+                        await edit(status_msg, f"Indexing {scanned} ({rate:.0f}/s)", 10, sts)
                     except Exception:
                         pass
-                # Flush in chunks to avoid huge memory
-                if len(collected) >= 500:
-                    await db.mark_files_bulk(collected, target_chat, dup_uri)
-                    collected = []
-        if collected:
-            await db.mark_files_bulk(collected, target_chat, dup_uri)
-        print(f"Target index done: scanned {scanned} messages")
+
+            # Bound pending DB tasks so we don't queue forever
+            if len(pending_writes) >= 3:
+                done, pending_writes = await asyncio.wait(
+                    pending_writes, return_when=asyncio.FIRST_COMPLETED
+                )
+                pending_writes = set(pending_writes)
+
+        _schedule_flush()
+        if pending_writes:
+            await asyncio.gather(*pending_writes, return_exceptions=True)
+
+        elapsed = time.time() - t0
+        print(
+            f"Target index done: scanned={scanned} media≈{media_total} "
+            f"in {elapsed:.1f}s ({scanned / max(elapsed, 0.1):.0f} msg/s)"
+        )
         return scanned
     except Exception as e:
-        print(f"Target indexing failed (continuing without full index): {e}")
-        if collected:
-            try:
-                await db.mark_files_bulk(collected, target_chat, dup_uri)
-            except Exception:
-                pass
+        print(f"Target indexing failed (continuing): {e}")
+        _schedule_flush()
+        if pending_writes:
+            await asyncio.gather(*pending_writes, return_exceptions=True)
         return scanned
 
 
