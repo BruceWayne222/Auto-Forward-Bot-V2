@@ -192,14 +192,39 @@ async def pub_(bot, message):
           skip_duplicate = data.get('skip_duplicate', False) if isinstance(data, dict) else False
           disabled_types = data.get('filters', []) if isinstance(data, dict) else []
 
+          # Always try to auto-skip files already in the target.
+          # If user disabled duplicate in settings, still index when possible.
+          dup_uri = None
+          target_for_dup = sts.get('TO')
+          if skip_duplicate:
+              dup_uri, target_for_dup = skip_duplicate
+          else:
+              # Enable in-memory/db skip for this run using bot's default DB
+              skip_duplicate = [None, sts.get('TO')]
+              dup_uri, target_for_dup = skip_duplicate
+
+          await msg_edit(m, "<code>Scanning target for already-uploaded files…</code>")
+          await index_target_chat(
+              client, target_for_dup, dup_uri, status_msg=m, sts=sts, max_scan=10000
+          )
+          await edit(m, 'Progressing', 10, sts)
+
           # Semaphore for parallel copy mode
           sem = asyncio.Semaphore(copy_concurrency)
           pending_tasks = set()
 
           async def _bounded_copy(details):
               async with sem:
-                  await copy(client, details, m, sts, user)
-                  sts.add('total_files')
+                  ok = await copy(client, details, m, sts, user)
+                  if ok is not False:
+                      sts.add('total_files')
+                      # Mark as forwarded only after success
+                      fid = details.get("file_unique_id")
+                      if fid:
+                          try:
+                              await db.mark_file_forwarded(fid, target_for_dup, dup_uri)
+                          except Exception:
+                              pass
                   await smart_sleep(user, base_sleep, safe_mode, m, sts)
 
           async for message in client.iter_messages(
@@ -248,12 +273,14 @@ async def pub_(bot, message):
                         MSG = []
                 else:
                     new_caption = custom_caption(message, caption)
+                    from .test import get_file_unique_id as _gfui
                     details = {
                         "msg_id": message.id,
                         "media": media(message),
                         "caption": new_caption,
                         "button": button,
                         "protect": protect,
+                        "file_unique_id": getattr(message, "_fwd_file_unique_id", None) or _gfui(message),
                     }
                     if copy_concurrency <= 1:
                         await _bounded_copy(details)
@@ -296,6 +323,53 @@ async def pub_(bot, message):
 # Timeouts (seconds) so a stalled Telegram transfer can't freeze the whole job
 DOWNLOAD_TIMEOUT = 600   # 10 min
 UPLOAD_TIMEOUT = 600     # 10 min
+
+
+async def index_target_chat(client, target_chat, dup_uri, status_msg=None, sts=None, max_scan=8000):
+    """
+    Scan the target chat for media already present and record their
+    file_unique_id so the forward loop auto-skips them.
+    Returns how many unique media files were indexed.
+    """
+    from .test import get_file_unique_id
+
+    collected = []
+    scanned = 0
+    try:
+        if status_msg and sts:
+            try:
+                await edit(status_msg, "Indexing target…", 10, sts)
+            except Exception:
+                pass
+        print(f"Indexing target chat {target_chat} for already-uploaded files…")
+        async for msg in client.get_chat_history(target_chat, limit=max_scan):
+            scanned += 1
+            uid = get_file_unique_id(msg)
+            if uid:
+                collected.append(uid)
+            if scanned % 200 == 0:
+                print(f"  indexed {scanned} msgs, {len(collected)} media so far…")
+                if status_msg and sts:
+                    try:
+                        await edit(status_msg, f"Indexing {scanned}…", 10, sts)
+                    except Exception:
+                        pass
+                # Flush in chunks to avoid huge memory
+                if len(collected) >= 500:
+                    await db.mark_files_bulk(collected, target_chat, dup_uri)
+                    collected = []
+        if collected:
+            await db.mark_files_bulk(collected, target_chat, dup_uri)
+        print(f"Target index done: scanned {scanned} messages")
+        return scanned
+    except Exception as e:
+        print(f"Target indexing failed (continuing without full index): {e}")
+        if collected:
+            try:
+                await db.mark_files_bulk(collected, target_chat, dup_uri)
+            except Exception:
+                pass
+        return scanned
 
 
 async def _download_and_reupload(bot, msg, sts, m=None):
@@ -467,6 +541,7 @@ def _is_network_error(err: str) -> bool:
 async def copy(bot, msg, m, sts, user_id=None, _retries=0):
     """
     Copy / send one message.
+    Returns True on success, False on permanent failure.
     1) Fast path: send_cached_media / copy_message (with timeout)
     2) On CHAT_FORWARDS_RESTRICTED → download + re-upload
     3) Retries on FloodWait and network/timeout errors (with backoff)
@@ -497,13 +572,14 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
                 ),
                 timeout=FAST_TIMEOUT,
             )
+        return True
     except asyncio.TimeoutError:
         print(f"Fast-path copy timed out msg={msg.get('msg_id')} (try {_retries+1})")
         if _retries < MAX_RETRIES:
             await asyncio.sleep(2 + _retries)
             return await copy(bot, msg, m, sts, user_id, _retries + 1)
         sts.add('deleted')
-        return
+        return False
     except FloodWait as e:
         if user_id is not None:
             note_flood(user_id)
@@ -515,6 +591,7 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
             return await copy(bot, msg, m, sts, user_id, _retries + 1)
         print(f"copy gave up after FloodWaits msg={msg.get('msg_id')}")
         sts.add('deleted')
+        return False
     except Exception as e:
         err = str(e).lower()
 
@@ -523,7 +600,7 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
             try:
                 print(f"Restricted content detected for msg {msg.get('msg_id')} – downloading & re-uploading…")
                 await _download_and_reupload(bot, msg, sts, m=m)
-                return
+                return True
             except FloodWait as fw:
                 if user_id is not None:
                     note_flood(user_id)
@@ -534,10 +611,9 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
                     return await copy(bot, msg, m, sts, user_id, _retries + 1)
                 print(f"download/reupload gave up after FloodWaits msg={msg.get('msg_id')}")
                 sts.add('deleted')
-                return
+                return False
             except Exception as dl_err:
                 dl_err_s = str(dl_err).lower()
-                # Network errors during download/upload → retry whole copy with backoff
                 if _is_network_error(dl_err_s) and _retries < MAX_RETRIES:
                     backoff = min(2 ** _retries + random.uniform(0.5, 2.0), 45)
                     print(f"Network error on download/reupload msg={msg.get('msg_id')} "
@@ -550,7 +626,7 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
                     return await copy(bot, msg, m, sts, user_id, _retries + 1)
                 print(f"Failed to download/reupload message {msg.get('msg_id')}: {dl_err}")
                 sts.add('deleted')
-                return
+                return False
 
         # Network / timeout style errors on the fast path
         if _is_network_error(err) and _retries < MAX_RETRIES:
@@ -566,6 +642,7 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
 
         print(f"Failed to copy message {msg.get('msg_id')}: {e}")
         sts.add('deleted')
+        return False
 
 
 async def forward(bot, msg, m, sts, protect, user_id=None, _retries=0):

@@ -131,6 +131,11 @@ async def start_clone_bot(FwdBot, data=None):
                         if is_dup:
                             yield "DUPLICATE"
                             continue
+                # Attach unique id so success path can mark after send
+                try:
+                    message._fwd_file_unique_id = get_file_unique_id(message)
+                except Exception:
+                    pass
                 yield message
 
             # Always advance past the whole requested range (gaps are fine)
