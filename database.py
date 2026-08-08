@@ -227,29 +227,26 @@ class Database:
           print(f"[duplicate-mark] failed: {e}")
 
     async def mark_files_bulk(self, file_unique_ids, chat_id, dup_uri=None):
-       """Bulk-insert many file ids (used when indexing the target chat)."""
-       ids = [fid for fid in file_unique_ids if fid]
+       """Bulk-upsert many file ids (used when indexing the target chat)."""
+       ids = list({fid for fid in file_unique_ids if fid})
        if not ids:
           return 0
        try:
           collection = self._get_dup_collection(dup_uri)
           import time as _t
-          ops = []
           from pymongo import UpdateOne
-          for fid in ids:
-             ops.append(UpdateOne(
-                {"chat_id": int(chat_id), "file_id": fid},
-                {"$setOnInsert": {
-                   "chat_id": int(chat_id),
-                   "file_id": fid,
-                   "ts": _t.time(),
-                }},
+          ts = _t.time()
+          cid = int(chat_id)
+          ops = [
+             UpdateOne(
+                {"chat_id": cid, "file_id": fid},
+                {"$setOnInsert": {"chat_id": cid, "file_id": fid, "ts": ts}},
                 upsert=True,
-             ))
-          if ops:
-             result = await collection.bulk_write(ops, ordered=False)
-             return (result.upserted_count or 0) + (result.modified_count or 0)
-          return 0
+             )
+             for fid in ids
+          ]
+          result = await collection.bulk_write(ops, ordered=False)
+          return result.upserted_count or 0
        except Exception as e:
           print(f"[duplicate-bulk] failed: {e}")
           return 0
