@@ -126,7 +126,11 @@ async def start_clone_bot(FwdBot, data=None):
                             is_dup = await db.is_duplicate_file(
                                 file_unique_id, target_chat, dup_uri
                             )
-                        except Exception:
+                        except Exception as e:
+                            print(
+                                f"[duplicate-check] error msg={message.id}: "
+                                f"{type(e).__name__}: {e}"
+                            )
                             is_dup = False
                         if is_dup:
                             yield "DUPLICATE"
