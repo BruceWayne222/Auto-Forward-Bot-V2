@@ -1091,6 +1091,26 @@ async def terminate_frwding(bot, m):
     await m.answer("Forwarding cancelled !", show_alert=True)
 
 
+@Client.on_message(filters.private & filters.command(["cancel"]))
+async def cancel_task(bot, message):
+    """Cancel the current user's running forward task via command."""
+    user_id = message.from_user.id
+    was_running = bool(temp.lock.get(user_id)) and str(temp.lock.get(user_id)) == "True"
+    temp.CANCEL[user_id] = True
+    if was_running:
+        await message.reply(
+            "<b>🛑 Cancel requested.</b>\n"
+            "The current forward job will stop shortly.\n"
+            "Use <code>/task</code> to check status, or <code>/unlock</code> if it stays stuck."
+        )
+    else:
+        temp.lock[user_id] = False
+        await message.reply(
+            "<b>No active task found.</b>\n"
+            "If something feels stuck, try <code>/unlock</code> then <code>/fwd</code>."
+        )
+
+
 @Client.on_message(filters.private & filters.command(["unlock", "forceunlock"]))
 async def force_unlock(bot, message):
     """Clear a stuck lock so /fwd can start again without restarting the service."""
