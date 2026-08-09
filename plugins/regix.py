@@ -239,6 +239,20 @@ async def pub_(bot, message):
         is_continuous = getattr(sts, 'continuous', False)
         skip_duplicate = data.get('skip_duplicate', False) if isinstance(data, dict) else False
         disabled_types = data.get('filters', []) if isinstance(data, dict) else []
+        # Size limit: [max_mb, size_limit_flag]
+        # size_limit_flag True  = "more than" (only forward files bigger than max_mb)
+        # size_limit_flag False = "less than" (only forward files smaller than max_mb)
+        media_size_cfg = data.get('media_size') if isinstance(data, dict) else None
+        size_limit_mb = None
+        size_limit_more_than = False
+        if media_size_cfg and isinstance(media_size_cfg, (list, tuple)) and len(media_size_cfg) >= 2:
+            try:
+                size_limit_mb = float(media_size_cfg[0])
+                size_limit_more_than = bool(media_size_cfg[1])
+            except Exception:
+                size_limit_mb = None
+        if size_limit_mb:
+            print(f"[fwd] size filter active: {'more than' if size_limit_more_than else 'less than'} {size_limit_mb} MB")
 
         # Always auto-skip files already in the target
         if skip_duplicate:
@@ -324,6 +338,28 @@ async def pub_(bot, message):
                 if msg_type in disabled_types:
                     sts.add('filtered')
                     continue
+
+                # --- Size limit filter (skip oversized / undersized files) ---
+                if size_limit_mb is not None and message.media:
+                    try:
+                        media_obj = getattr(message, message.media.value, None)
+                        fsize = getattr(media_obj, "file_size", None) if media_obj else None
+                        if fsize:
+                            fsize_mb = fsize / (1024 * 1024)
+                            if size_limit_more_than:
+                                # only forward files BIGGER than limit
+                                if fsize_mb <= size_limit_mb:
+                                    print(f"  skip msg {message.id}: {fsize_mb:.1f} MB <= {size_limit_mb} MB (more-than filter)")
+                                    sts.add('filtered')
+                                    continue
+                            else:
+                                # only forward files SMALLER than limit
+                                if fsize_mb >= size_limit_mb:
+                                    print(f"  skip msg {message.id}: {fsize_mb:.1f} MB >= {size_limit_mb} MB (less-than filter)")
+                                    sts.add('filtered')
+                                    continue
+                    except Exception as size_err:
+                        print(f"size check error msg={getattr(message, 'id', '?')}: {size_err}")
 
                 if forward_tag:
                     MSG.append(message.id)
@@ -627,6 +663,18 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 disable_web_page_preview=True,
             )
         return
+
+    # Hard safety: never download files larger than 200 MB (Render Free / low RAM)
+    try:
+        media_obj = getattr(original, original.media.value, None)
+        fsize = getattr(media_obj, "file_size", None) if media_obj else None
+        if fsize and (fsize / (1024 * 1024)) > 200:
+            print(f"  HARD SKIP msg {msg_id}: {fsize / (1024*1024):.1f} MB > 200 MB safety limit")
+            raise ValueError(f"File too large ({fsize / (1024*1024):.1f} MB) — skipped")
+    except ValueError:
+        raise
+    except Exception:
+        pass
 
     last_pct = {"value": -1}
     last_update = {"ts": time.time()}
