@@ -1063,6 +1063,28 @@ def _status_lock(key):
         _STATUS_LOCKS[key] = lock
     return lock
 
+async def _send_fresh_status(msg, text, button=None):
+    """
+    Editing is blocked (FloodWait on this message/chat). sendMessage has its
+    own, separate flood bucket from editMessage, so send a brand-new message
+    instead of leaving the user staring at stale/frozen text forever.
+    Registers the new message under its own key so later calls edit it directly.
+    """
+    try:
+        new_msg = await msg.reply(text, quote=False, reply_markup=button)
+    except Exception as e:
+        print(f"[status] Fallback send_message also failed: {type(e).__name__}: {e}")
+        return None
+    new_key = _status_key(new_msg)
+    _STATUS_STATE[new_key] = {
+        "last_attempt": time.monotonic(),
+        "flood_until": 0.0,
+        "last_flood_log": 0.0,
+        "last_text": text,
+    }
+    print(f"[status] Edit blocked — sent fresh status message id={getattr(new_msg, 'id', None)}")
+    return new_msg
+
 async def msg_edit(msg, text, button=None, wait=None):
     """Edit the status message without creating Telegram FloodWait storms."""
     if msg is None:
@@ -1078,6 +1100,11 @@ async def msg_edit(msg, text, button=None, wait=None):
         })
         now = time.monotonic()
         if now < state["flood_until"]:
+            # Already known to be blocked for this message. Don't just drop
+            # important/changed updates on the floor — surface them via a
+            # fresh message so the user isn't stuck watching stale text.
+            if wait or text != state["last_text"]:
+                return await _send_fresh_status(msg, text, button)
             return None
 
         # Normal progress: at most one edit every 3 seconds.
@@ -1104,7 +1131,9 @@ async def msg_edit(msg, text, button=None, wait=None):
             if log_now - state["last_flood_log"] >= 30:
                 state["last_flood_log"] = log_now
                 print(f"[status] FloodWait for status edits: {seconds}s; suppressing edits until cooldown")
-            return None
+            # This edit was blocked right now — don't lose the message the
+            # caller is trying to show. Fall back to a fresh message.
+            return await _send_fresh_status(msg, text, button)
         except RPCError as e:
             print(f"[status] Telegram status edit failed: {type(e).__name__}: {e}")
             return None
