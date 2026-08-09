@@ -333,6 +333,13 @@ async def pub_(bot, message):
 
                 pling += 1
                 if pling % 25 == 0:
+                    print(
+                        f"[fwd] progress fetched={pling} "
+                        f"forwarded={sts.get('total_files')} "
+                        f"duplicate={sts.get('duplicate')} "
+                        f"filtered={sts.get('filtered')} "
+                        f"deleted={sts.get('deleted')}"
+                    )
                     try:
                         await edit(m, 'Progressing', 10, sts)
                     except Exception:
@@ -1034,16 +1041,72 @@ PROGRESS = """
 ⏳️ ETA: {5}
 """
 
-async def msg_edit(msg, text, button=None, wait=None):
+# ---------- Telegram status-message rate limiter ----------
+_STATUS_STATE = {}
+_STATUS_LOCKS = {}
+
+def _status_key(msg):
     try:
-        return await msg.edit(text, reply_markup=button)
-    except MessageNotModified:
-        pass 
-    except FloodWait as e:
-        if wait:
-           await asyncio.sleep(e.value)
-           return await msg_edit(msg, text, button, wait)
-        
+        return (getattr(getattr(msg, "chat", None), "id", None), getattr(msg, "id", None))
+    except Exception:
+        return (id(msg), 0)
+
+def _status_lock(key):
+    lock = _STATUS_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _STATUS_LOCKS[key] = lock
+    return lock
+
+async def msg_edit(msg, text, button=None, wait=None):
+    """Edit the status message without creating Telegram FloodWait storms."""
+    if msg is None:
+        return None
+    key = _status_key(msg)
+    lock = _status_lock(key)
+    async with lock:
+        state = _STATUS_STATE.setdefault(key, {
+            "last_attempt": 0.0,
+            "flood_until": 0.0,
+            "last_flood_log": 0.0,
+            "last_text": None,
+        })
+        now = time.monotonic()
+        if now < state["flood_until"]:
+            return None
+
+        # Normal progress: at most one edit every 3 seconds.
+        # Final/error messages can use wait=True for a shorter 0.75s interval,
+        # but they still NEVER sleep through a FloodWait.
+        min_interval = 0.75 if wait else 3.0
+        if now - state["last_attempt"] < min_interval:
+            return None
+        if not wait and text == state["last_text"]:
+            return None
+
+        state["last_attempt"] = now
+        try:
+            result = await msg.edit(text, reply_markup=button)
+            state["last_text"] = text
+            return result
+        except MessageNotModified:
+            state["last_text"] = text
+            return None
+        except FloodWait as e:
+            seconds = max(1, int(getattr(e, "value", 1)))
+            state["flood_until"] = time.monotonic() + seconds
+            log_now = time.monotonic()
+            if log_now - state["last_flood_log"] >= 30:
+                state["last_flood_log"] = log_now
+                print(f"[status] FloodWait for status edits: {seconds}s; suppressing edits until cooldown")
+            return None
+        except RPCError as e:
+            print(f"[status] Telegram status edit failed: {type(e).__name__}: {e}")
+            return None
+        except Exception as e:
+            print(f"[status] status edit failed: {type(e).__name__}: {e}")
+            return None
+
 async def edit(msg, title, status, sts):
    i = sts.get(full=True)
    status = 'Forwarding' if status == 10 else f"Sleeping {status} s" if str(status).isnumeric() else status
