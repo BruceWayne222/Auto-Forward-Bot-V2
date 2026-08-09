@@ -21,16 +21,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 TEXT = Translation.TEXT
 
-# Target indexing is intentionally OFF by default. Duplicate checks are still
-# performed against MongoDB for every source file, and successful forwards are
-# recorded automatically. Set ENABLE_TARGET_INDEX=true on Render only when you
-# explicitly want to bootstrap the duplicate database from existing target
-# messages.
-ENABLE_TARGET_INDEX = os.getenv("ENABLE_TARGET_INDEX", "false").strip().lower() in {
-    "1", "true", "yes", "on"
-}
-TARGET_INDEX_LIMIT = max(100, int(os.getenv("TARGET_INDEX_LIMIT", "3000")))
-
 # ---------- Rate-limit helpers (fast but ban-safe) ----------
 _FLOOD_STREAK = {}   # user_id -> consecutive flood count
 _LAST_FLOOD = {}     # user_id -> timestamp of last FloodWait
@@ -111,26 +101,20 @@ async def pub_(bot, message):
         pass
 
     m = await msg_edit(message.message, "<code>① Loading settings from database…</code>")
-    print(f"[fwd] user={user} step=get_data")
+    print(f"[fwd] user={user} step=get_data db_uri_configured={bool(Config.DATABASE_URI)}")
     try:
         _bot, caption, forward_tag, data, protect, button = await asyncio.wait_for(
-            sts.get_data(user), timeout=20
+            sts.get_data(user), timeout=15
         )
     except asyncio.TimeoutError:
         return await msg_edit(
             m,
-            "<b>Database timeout (20s).</b>\nCheck <code>DATABASE</code> URI on Render.\nThen /unlock and /fwd again.",
+            "<b>Database timeout (15s).</b>\nMongoDB did not answer in time. Check the <code>DATABASE</code> URI, Network Access/IP rules, and MongoDB cluster status on Render.\nThen /unlock and /fwd again.",
             wait=True,
         )
     except Exception as e:
         print(f"[fwd] get_data error: {e}")
         return await msg_edit(m, f"<b>DB error:</b>\n<code>{e}</code>", wait=True)
-
-    print(
-        f"[fwd] settings loaded: bot={'yes' if _bot else 'no'} "
-        f"duplicate={'on' if data.get('skip_duplicate') else 'off'} "
-        f"delay={data.get('delay')} safe={data.get('safe_mode')}"
-    )
 
     if not _bot:
         return await msg_edit(
@@ -277,40 +261,35 @@ async def pub_(bot, message):
             skip_duplicate = [None, sts.get('TO')]
             dup_uri, target_for_dup = skip_duplicate
 
-        if ENABLE_TARGET_INDEX:
+        # Do NOT scan thousands of target messages on every /fwd.
+        # Successful forwards are already recorded in the duplicate DB.
+        # Enable a history scan only when explicitly requested:
+        # ENABLE_TARGET_INDEX=true and optionally TARGET_INDEX_LIMIT=3000.
+        enable_index = os.getenv("ENABLE_TARGET_INDEX", "false").lower() in ("1", "true", "yes", "on")
+        try:
+            index_limit = max(100, int(os.getenv("TARGET_INDEX_LIMIT", "3000")))
+        except Exception:
+            index_limit = 3000
+
+        if enable_index:
             try:
-                await msg_edit(
-                    m,
-                    f"<code>Scanning target for duplicates (max {TARGET_INDEX_LIMIT:,})…</code>"
-                )
-                print(
-                    f"[fwd] target indexing ENABLED: chat={target_for_dup} "
-                    f"limit={TARGET_INDEX_LIMIT}"
-                )
+                await msg_edit(m, f"<code>⑥ Indexing target history (max {index_limit:,})…</code>")
                 await index_target_chat(
-                    client,
-                    target_for_dup,
-                    dup_uri,
-                    status_msg=m,
-                    sts=sts,
-                    max_scan=TARGET_INDEX_LIMIT,
+                    client, target_for_dup, dup_uri, status_msg=m, sts=sts, max_scan=index_limit
                 )
             except Exception as idx_err:
                 # Indexing is best-effort — never abort the whole job for it.
-                print(f"Index step error (continuing): {idx_err}")
+                print(f"[fwd] Index step error (continuing): {idx_err}")
                 try:
-                    await msg_edit(
-                        m,
-                        f"<code>Index warning: {idx_err} — continuing…</code>"
-                    )
+                    await msg_edit(m, f"<code>Index warning: {idx_err} — continuing…</code>")
                 except Exception:
                     pass
         else:
-            print("[fwd] target indexing disabled; using MongoDB duplicate history")
-            await msg_edit(
-                m,
-                "<code>⑤ Duplicate index skipped — checking saved history while forwarding…</code>"
-            )
+            print("[fwd] Target history indexing disabled; using duplicate database only")
+            try:
+                await msg_edit(m, "<code>⑥ Duplicate history ready — starting forward…</code>")
+            except Exception:
+                pass
 
         await edit(m, 'Progressing', 10, sts)
 
@@ -880,15 +859,6 @@ async def copy(bot, msg, m, sts, user_id=None, _retries=0):
     MAX_RETRIES = 6
     FAST_TIMEOUT = 120  # seconds for non-download copy path
     try:
-        # Native Telegram copy/forward does not expose byte-level download/upload
-        # progress because no local download happens. Still show a live stage so
-        # the user never gets stuck looking at "Loading settings".
-        try:
-            if m:
-                await msg_edit(m, f"<code>Forwarding message {msg.get('msg_id', '?')}…</code>")
-        except Exception:
-            pass
-
         if msg.get("media") and msg.get("caption") is not None:
             await asyncio.wait_for(
                 bot.send_cached_media(
@@ -1065,23 +1035,14 @@ PROGRESS = """
 """
 
 async def msg_edit(msg, text, button=None, wait=None):
-    """Best-effort status update that never hides unexpected Telegram errors."""
-    if msg is None:
-        return None
     try:
         return await msg.edit(text, reply_markup=button)
     except MessageNotModified:
-        return msg
+        pass 
     except FloodWait as e:
         if wait:
-            await asyncio.sleep(e.value)
-            return await msg_edit(msg, text, button, wait)
-        print(f"[status] FloodWait while editing status: {e.value}s")
-    except Exception as e:
-        # The forwarding job must continue even if Telegram rejects a status edit,
-        # but the reason must be visible in Render logs instead of being swallowed.
-        print(f"[status] edit failed: {type(e).__name__}: {e}")
-    return msg
+           await asyncio.sleep(e.value)
+           return await msg_edit(msg, text, button, wait)
         
 async def edit(msg, title, status, sts):
    i = sts.get(full=True)

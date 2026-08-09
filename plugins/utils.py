@@ -36,26 +36,40 @@ class STS:
        return int(no) / by 
     
     async def get_data(self, user_id):
-        bot = await db.get_bot(user_id)
-        k, filters = self, await db.get_filters(user_id)
-        size, configs = None, await db.get_configs(user_id)
-        if configs['duplicate']:
-           duplicate = [configs['db_uri'], self.TO]
+        # Fetch bot + config together. The old implementation called
+        # get_configs() twice (once indirectly through get_filters()), which
+        # could make /fwd appear stuck on "Loading settings..." when MongoDB
+        # was slow. Keep a single config read and derive filters locally.
+        import asyncio
+
+        bot_task = asyncio.create_task(db.get_bot(user_id))
+        config_task = asyncio.create_task(db.get_configs(user_id))
+        bot, configs = await asyncio.gather(bot_task, config_task)
+
+        filter_config = configs.get('filters') or {}
+        filters = [str(k) for k, v in filter_config.items() if v is False]
+
+        if configs.get('duplicate'):
+            duplicate = [configs.get('db_uri'), self.TO]
         else:
-           duplicate = False
-        button = parse_buttons(configs['button'] if configs['button'] else '')
-        if configs['file_size'] != 0:
-            size = [configs['file_size'], configs['size_limit']]
-        return bot, configs['caption'], configs['forward_tag'], {
-                'chat_id': k.FROM,
-                'limit': k.limit,
-                'offset': k.skip,
+            duplicate = False
+
+        button = parse_buttons(configs.get('button') or '')
+        size = None
+        if configs.get('file_size', 0) != 0:
+            size = [configs.get('file_size'), configs.get('size_limit')]
+
+        return bot, configs.get('caption'), configs.get('forward_tag', False), {
+                'chat_id': self.FROM,
+                'limit': self.limit,
+                'offset': self.skip,
                 'filters': filters,
-                'keywords': configs['keywords'],
+                'keywords': configs.get('keywords'),
                 'media_size': size,
-                'extensions': configs['extension'],
+                'extensions': configs.get('extension'),
                 'skip_duplicate': duplicate,
                 'delay': configs.get('delay', 5),
                 'safe_mode': configs.get('safe_mode', True),
                 'batch_size': configs.get('batch_size', 30),
-            }, configs['protect'], button
+            }, configs.get('protect'), button
+
