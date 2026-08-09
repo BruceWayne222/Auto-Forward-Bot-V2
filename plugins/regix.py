@@ -1063,15 +1063,28 @@ def _status_lock(key):
         _STATUS_LOCKS[key] = lock
     return lock
 
-async def _send_fresh_status(msg, text, button=None):
+async def _send_fresh_status(msg, text, button, state):
     """
-    Editing is blocked (FloodWait on this message/chat). sendMessage has its
-    own, separate flood bucket from editMessage, so send a brand-new message
-    instead of leaving the user staring at stale/frozen text forever.
-    Registers the new message under its own key so later calls edit it directly.
+    Editing is blocked. Try sending a brand-new message instead (sendMessage
+    is usually a separate flood bucket from editMessage). If sendMessage is
+    ALSO FloodWait-blocked, this account is under a broad restriction right
+    now — stop hammering Telegram on every tick and just wait it out.
     """
     try:
         new_msg = await msg.reply(text, quote=False, reply_markup=button)
+    except FloodWait as e:
+        seconds = max(1, int(getattr(e, "value", 1)))
+        state["flood_until"] = max(state.get("flood_until", 0), time.monotonic() + seconds)
+        state["send_blocked"] = True
+        log_now = time.monotonic()
+        if log_now - state.get("last_flood_log", 0) >= 30:
+            state["last_flood_log"] = log_now
+            print(
+                f"[status] sendMessage ALSO FloodWait-blocked for {seconds}s — "
+                f"account is broadly rate-limited right now. Forwarding itself "
+                f"may still be working; only status text is paused."
+            )
+        return None
     except Exception as e:
         print(f"[status] Fallback send_message also failed: {type(e).__name__}: {e}")
         return None
@@ -1081,6 +1094,7 @@ async def _send_fresh_status(msg, text, button=None):
         "flood_until": 0.0,
         "last_flood_log": 0.0,
         "last_text": text,
+        "send_blocked": False,
     }
     print(f"[status] Edit blocked — sent fresh status message id={getattr(new_msg, 'id', None)}")
     return new_msg
@@ -1097,14 +1111,19 @@ async def msg_edit(msg, text, button=None, wait=None):
             "flood_until": 0.0,
             "last_flood_log": 0.0,
             "last_text": None,
+            "send_blocked": False,
         })
         now = time.monotonic()
         if now < state["flood_until"]:
+            if state.get("send_blocked"):
+                # Already confirmed BOTH edit and send are blocked for this
+                # window — don't keep hammering Telegram every progress tick.
+                return None
             # Already known to be blocked for this message. Don't just drop
             # important/changed updates on the floor — surface them via a
             # fresh message so the user isn't stuck watching stale text.
             if wait or text != state["last_text"]:
-                return await _send_fresh_status(msg, text, button)
+                return await _send_fresh_status(msg, text, button, state)
             return None
 
         # Normal progress: at most one edit every 3 seconds.
@@ -1133,7 +1152,7 @@ async def msg_edit(msg, text, button=None, wait=None):
                 print(f"[status] FloodWait for status edits: {seconds}s; suppressing edits until cooldown")
             # This edit was blocked right now — don't lose the message the
             # caller is trying to show. Fall back to a fresh message.
-            return await _send_fresh_status(msg, text, button)
+            return await _send_fresh_status(msg, text, button, state)
         except RPCError as e:
             print(f"[status] Telegram status edit failed: {type(e).__name__}: {e}")
             return None
