@@ -7,6 +7,7 @@ from pyrogram import Client, __version__
 from pyrogram.raw.all import layer 
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait 
+from pyrogram.types import BotCommand
 
 logging.config.fileConfig('logging.conf')
 logging.getLogger().setLevel(logging.INFO)
@@ -36,6 +37,29 @@ class Bot(Client):
         self.set_parse_mode(ParseMode.DEFAULT)
         text = "**๏[-ิ_•ิ]๏ bot restarted !**"
         logging.info(text)
+
+        # Register commands in Telegram dropdown menu
+        try:
+            await self.set_bot_commands([
+                BotCommand("start", "Start the bot"),
+                BotCommand("fwd", "Start forwarding messages"),
+                BotCommand("forward", "Start forwarding messages"),
+                BotCommand("task", "Check if a forward task is running"),
+                BotCommand("status", "Check your current task status"),
+                BotCommand("mystatus", "Check your current task status"),
+                BotCommand("cancel", "Cancel the running forward task"),
+                BotCommand("settings", "Open bot settings"),
+                BotCommand("unlock", "Force unlock a stuck task"),
+                BotCommand("forceunlock", "Force unlock a stuck task"),
+                BotCommand("reset", "Reset your data"),
+                BotCommand("unequify", "Remove duplicate files"),
+                BotCommand("genstring", "Generate userbot session string"),
+                BotCommand("getstring", "Generate userbot session string"),
+                BotCommand("help", "Show help"),
+            ])
+            logging.info("Bot commands menu registered successfully")
+        except Exception as e:
+            logging.error(f"Failed to set bot commands: {e}")
 
         # Check if database URI is default broken one
         if "mongodb+srv://chhjgjkkjhkjhkjh@cluster0.xowzpr4.mongodb.net/" in Config.DATABASE_URI:
