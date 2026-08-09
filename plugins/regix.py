@@ -316,13 +316,18 @@ async def pub_(bot, message):
                 except Exception:
                     await asyncio.sleep(base_sleep)
 
+        async def _cancel_check():
+            return temp.CANCEL.get(user) is True
+
         async for message in client.iter_messages(
             client,
             chat_id=sts.get('FROM'),
             limit=int(sts.get('limit')),
             offset=int(sts.get('skip')) if sts.get('skip') else 0,
             continuous=is_continuous,
-            skip_duplicate=skip_duplicate
+            skip_duplicate=skip_duplicate,
+            status_msg=m,
+            cancel_check=_cancel_check
         ):
             try:
                 if await is_cancelled(client, user, m, sts):

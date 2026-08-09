@@ -51,7 +51,9 @@ async def start_clone_bot(FwdBot, data=None):
       search: str = None,
       filter: "types.TypeMessagesFilter" = None,
       continuous: bool = False,
-      skip_duplicate: Union[list, bool] = False
+      skip_duplicate: Union[list, bool] = False,
+      status_msg=None,
+      cancel_check=None
       ) -> Optional[AsyncGenerator["types.Message", None]]:
         """
         Iterate message IDs sequentially from `offset` up to `limit` (inclusive).
@@ -84,7 +86,36 @@ async def start_clone_bot(FwdBot, data=None):
             try:
                 messages = await self.get_messages(chat_id, id_list)
             except FloodWait as e:
-                await asyncio.sleep(e.value + random.uniform(1.5, 3.5))
+                wait_s = e.value + random.uniform(1.5, 3.5)
+                mins = int(wait_s // 60)
+                print(
+                    f"[iter_messages] FloodWait fetching {chat_id} offset={current}: "
+                    f"sleeping {wait_s:.0f}s (~{mins} min) before retrying"
+                )
+                if status_msg is not None:
+                    try:
+                        await status_msg.edit(
+                            f"<b>⏳ Telegram rate limit hit (FloodWait)</b>\n"
+                            f"This account is temporarily rate-limited by Telegram itself.\n"
+                            f"Waiting ~{mins} min before continuing automatically.\n"
+                            f"Send /cancel to stop this task instead of waiting."
+                        )
+                    except Exception:
+                        pass
+                # Sleep in short chunks so /cancel actually takes effect
+                # instead of blocking silently for hours.
+                remaining = wait_s
+                while remaining > 0:
+                    chunk = min(5, remaining)
+                    await asyncio.sleep(chunk)
+                    remaining -= chunk
+                    if cancel_check is not None:
+                        try:
+                            if await cancel_check():
+                                print("[iter_messages] Cancelled while waiting out FloodWait")
+                                return
+                        except Exception:
+                            pass
                 continue
             except Exception as e:
                 print(f"Failed to fetch messages from {chat_id} (offset {current}): {e}")
