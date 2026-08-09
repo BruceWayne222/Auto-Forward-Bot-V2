@@ -493,8 +493,10 @@ def _format_error(e: Exception) -> str:
     return f"<b>Error:</b>\n<code>{msg}</code>"
 
 # Timeouts (seconds) so a stalled Telegram transfer can't freeze the whole job
-DOWNLOAD_TIMEOUT = 600   # 10 min
-UPLOAD_TIMEOUT = 600     # 10 min
+# Reduced for Render Free (512MB) — long hangs were common with large files
+DOWNLOAD_TIMEOUT = 420   # 7 min
+UPLOAD_TIMEOUT = 300     # 5 min base (large files get a bit more)
+STALL_TIMEOUT = 90       # If progress % doesn't move for this many seconds → fail
 
 
 async def index_target_chat(client, target_chat, dup_uri, status_msg=None, sts=None, max_scan=10000):
@@ -627,14 +629,23 @@ async def _download_and_reupload(bot, msg, sts, m=None):
         return
 
     last_pct = {"value": -1}
-    last_update = {"ts": 0.0}
+    last_update = {"ts": time.time()}
     phase = {"name": "↓"}
+    stalled = {"flag": False}
 
     async def _progress(current, total):
         if not total:
             return
         now = time.time()
         pct = int(current * 100 / total) if total else 0
+
+        # Stall detection: no % movement for STALL_TIMEOUT seconds
+        if pct <= last_pct["value"] and (now - last_update["ts"]) > STALL_TIMEOUT:
+            stalled["flag"] = True
+            raise TimeoutError(
+                f"Transfer stalled at {pct}% for >{STALL_TIMEOUT}s (msg {msg_id})"
+            )
+
         if pct < last_pct["value"] + 5 and (now - last_update["ts"]) < 2.0 and pct < 100:
             return
         last_pct["value"] = pct
@@ -660,6 +671,7 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 pass
 
         phase["name"] = "↓"
+        last_update["ts"] = time.time()
         try:
             file_path = await asyncio.wait_for(
                 bot.download_media(
@@ -676,6 +688,13 @@ async def _download_and_reupload(bot, msg, sts, m=None):
 
         if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("download_media returned no file")
+
+        # Dynamic upload timeout: give larger files a bit more time (max 8 min)
+        try:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        except Exception:
+            file_size_mb = 0
+        dynamic_upload_timeout = min(480, max(UPLOAD_TIMEOUT, int(file_size_mb * 4) + 60))
 
         send_caption = caption
         if send_caption is None and original.caption:
@@ -697,7 +716,9 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 pass
         phase["name"] = "↑"
         last_pct["value"] = -1
-        print(f"  ↑ msg {msg_id}: uploading ({media_type})…")
+        last_update["ts"] = time.time()
+        stalled["flag"] = False
+        print(f"  ↑ msg {msg_id}: uploading ({media_type}, {file_size_mb:.1f} MB, timeout={dynamic_upload_timeout}s)…")
 
         async def _do_upload():
             if media_type == "photo":
@@ -722,10 +743,10 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 await bot.send_document(document=file_path, **kwargs)
 
         try:
-            await asyncio.wait_for(_do_upload(), timeout=UPLOAD_TIMEOUT)
+            await asyncio.wait_for(_do_upload(), timeout=dynamic_upload_timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Upload timed out after {UPLOAD_TIMEOUT}s for msg {msg_id}"
+                f"Upload timed out after {dynamic_upload_timeout}s for msg {msg_id}"
             )
 
         print(f"  ✓ msg {msg_id}: done ({media_type})")
@@ -736,6 +757,12 @@ async def _download_and_reupload(bot, msg, sts, m=None):
                 pass
 
     finally:
+        # Always clean temp files aggressively (important on Render Free)
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
         try:
             if os.path.isdir(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
