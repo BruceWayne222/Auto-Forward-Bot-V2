@@ -13,10 +13,10 @@ class Database:
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(
             uri,
-            serverSelectionTimeoutMS=8000,
-            connectTimeoutMS=8000,
-            socketTimeoutMS=15000,
-            heartbeatFrequencyMS=10000,
+            serverSelectionTimeoutMS=30000,   # 30s
+            connectTimeoutMS=20000,           # 20s
+            socketTimeoutMS=60000,            # 60s (was 15s — fixes bulk timeout)
+            heartbeatFrequencyMS=15000,
         )
         self.db = self._client[database_name]
         self.bot = self.db.bots
@@ -195,7 +195,13 @@ class Database:
           return self.dup
        client = self._dup_clients.get(dup_uri)
        if client is None:
-          client = motor.motor_asyncio.AsyncIOMotorClient(dup_uri)
+          client = motor.motor_asyncio.AsyncIOMotorClient(
+             dup_uri,
+             serverSelectionTimeoutMS=30000,
+             connectTimeoutMS=20000,
+             socketTimeoutMS=60000,
+             heartbeatFrequencyMS=15000,
+          )
           self._dup_clients[dup_uri] = client
        return client["AutoForwardBot"]["duplicates"]
 
