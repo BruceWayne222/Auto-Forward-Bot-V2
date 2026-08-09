@@ -42,7 +42,46 @@ async def restart(client, message):
     await asyncio.sleep(5)
     await msg.edit("<i>Server restarted successfully ✅</i>")
     os.execl(sys.executable, sys.executable, *sys.argv)
-    
+
+
+#==================Task Status==================#
+
+@Client.on_message(filters.private & filters.command(['task', 'mystatus', 'status']))
+async def task_status(client, message):
+    """Show whether the current user has an active forwarding task."""
+    user = message.from_user.id
+    is_locked = bool(temp.lock.get(user)) and str(temp.lock.get(user)) == "True"
+    is_cancelled = bool(temp.CANCEL.get(user))
+    active_chats = len(temp.IS_FRWD_CHAT) if temp.IS_FRWD_CHAT else 0
+    total_running = temp.forwardings
+
+    if is_locked:
+        status_line = "🟢 <b>Task is RUNNING</b>"
+        extra = (
+            "\n\n• Send <code>/cancel</code> to stop the current job.\n"
+            "• The progress message is being updated in this chat."
+        )
+        if is_cancelled:
+            status_line = "🟡 <b>Cancel requested</b> — waiting to stop…"
+            extra = "\n\nCancel flag is set. The job should stop shortly."
+    else:
+        status_line = "🔴 <b>No active task</b>"
+        extra = (
+            "\n\n• Use <code>/fwd</code> or <code>/forward</code> to start a new job.\n"
+            "• If you think a job is stuck, try <code>/cancel</code> then <code>/fwd</code> again."
+        )
+
+    text = (
+        f"<b>📋 Your Forward Status</b>\n\n"
+        f"{status_line}"
+        f"{extra}\n\n"
+        f"<b>Bot overview</b>\n"
+        f"• Active forward jobs: <code>{total_running}</code>\n"
+        f"• Chats currently locked: <code>{active_chats}</code>"
+    )
+    await message.reply_text(text, disable_web_page_preview=True)
+
+
 #==================Callback Functions==================#
 
 @Client.on_callback_query(filters.regex(r'^help'))
